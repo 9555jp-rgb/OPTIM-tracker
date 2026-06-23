@@ -1,5 +1,11 @@
 import streamlit as st
 
+st.set_page_config(
+    page_title="Molecular Energy Landscape",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
 st.title("OPTIM-tracker")
 st.write(
     "Let's start building! For help and inspiration, head over to [docs.streamlit.io](https://docs.streamlit.io/)."
@@ -9,7 +15,6 @@ import math
 import json
 import tempfile
 import urllib.parse
-import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
 
@@ -19,12 +24,6 @@ try:
     _PARAMIKO = True
 except ImportError:
     _PARAMIKO = False
-
-st.set_page_config(
-    page_title="Molecular Energy Landscape",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULTS = {
@@ -209,35 +208,61 @@ def merge_path(file_texts):
 
 # ── Network construction ──────────────────────────────────────────────────────
 
-def build_network(min_e, ts_e, triplets):
-    def nearest_min(e):
-        return min(range(len(min_e)), key=lambda j: abs(min_e[j] - e)) + 1
+_MATCH_TOL = 5e-14  # half a unit in the 13th decimal place
 
-    path_edges, node_coords = {}, {}
+
+def build_network(min_e_base, ts_e, triplets):
+    """Build the edge list and node table from all available data.
+
+    Nodes are seeded from min.data (min_e_base). Each path.info structure is
+    matched against the current node list using _MATCH_TOL. If no match exists
+    it is added as a new node, so structures unique to path.info are never lost.
+    Returns (edges, node_coords, all_e) where all_e is the complete energy list
+    including any nodes that came only from path.info.
+    """
+    all_e = list(min_e_base)  # grows as unmatched path.info structures are added
+    node_coords = {}
+
+    def find_match(e):
+        if not all_e:
+            return None
+        best = min(range(len(all_e)), key=lambda j: abs(all_e[j] - e))
+        return best + 1 if abs(all_e[best] - e) <= _MATCH_TOL else None
+
+    def get_or_create(struct):
+        nid = find_match(struct["e"])
+        if nid is None:
+            all_e.append(struct["e"])
+            nid = len(all_e)
+        if struct.get("c") and nid not in node_coords:
+            node_coords[nid] = struct["c"]
+        return nid
+
+    path_edges = {}
     for mA, ts, mB in triplets:
-        idA = nearest_min(mA["e"])
-        idB = nearest_min(mB["e"])
+        idA = get_or_create(mA)
+        idB = get_or_create(mB)
         key = (min(idA, idB), max(idA, idB))
         if key not in path_edges:
             path_edges[key] = {"e": ts["e"], "c": ts["c"]}
-        if idA not in node_coords:
-            node_coords[idA] = mA["c"]
-        if idB not in node_coords:
-            node_coords[idB] = mB["c"]
 
     edges = []
     for key, info in path_edges.items():
         edges.append({"idA": key[0], "idB": key[1],
                       "e": info["e"], "c": info["c"], "source": "path.info"})
+
+    # ts.data: match against full node list (min.data + any path.info additions)
     for ts_energy, ea, eb in ts_e:
-        # ea, eb are node energies (not file-local indices); re-map to merged IDs
-        idA = nearest_min(ea)
-        idB = nearest_min(eb)
+        idA = find_match(ea)
+        idB = find_match(eb)
+        if idA is None or idB is None:
+            continue
         key = (min(idA, idB), max(idA, idB))
         if key not in path_edges:
             edges.append({"idA": idA, "idB": idB,
                           "e": ts_energy, "c": None, "source": "ts.data only"})
-    return edges, node_coords
+
+    return edges, node_coords, all_e
 
 
 # ── Layout ────────────────────────────────────────────────────────────────────
@@ -946,15 +971,17 @@ Use the **Select node** dropdown on the right of the spider web.
     ts_files   = read_files(up_ts,   "ts.data",   folder)
     path_files = read_files(up_path, "path.info", folder)
 
-    if not min_files:
-        st.error("min.data is required. Add it to Results/ or upload it in the sidebar.")
+    if not min_files and not path_files:
+        st.error("Load at least one file — min.data, path.info, or both — to begin.")
         return
 
-    min_e,    min_lines,  min_stats  = merge_min(min_files)
-    ts_e,     ts_parts,   ts_stats   = merge_ts(ts_files, min_files) if ts_files else ([], [], [])
-    triplets, path_stats = merge_path(path_files) if path_files else ([], [])
+    min_e_base, min_lines, min_stats = merge_min(min_files) if min_files else ([], [], [])
+    ts_e,       ts_parts,  ts_stats  = merge_ts(ts_files, min_files) if ts_files else ([], [], [])
+    triplets,   path_stats            = merge_path(path_files) if path_files else ([], [])
 
-    edges, node_coords = build_network(min_e, ts_e, triplets)
+    edges, node_coords, min_e = build_network(min_e_base, ts_e, triplets)
+    n_path_only = len(min_e) - len(min_e_base)
+
     edge_tuples = tuple((ed["idA"], ed["idB"]) for ed in edges)
     spine = find_longest_chain(edge_tuples, len(min_e))
     pos = positions(len(min_e), spine)
@@ -963,9 +990,11 @@ Use the **Select node** dropdown on the right of the spider web.
     with st.sidebar:
         st.divider()
         st.caption("Merge summary")
-        show_merge_stats("min.data",  min_stats,  len(min_e))
+        show_merge_stats("min.data",  min_stats,  len(min_e_base))
         show_merge_stats("ts.data",   ts_stats,   len(ts_e))
         show_merge_stats("path.info", path_stats, len(triplets))
+        if n_path_only:
+            st.caption(f"{n_path_only} node(s) added from path.info with no min.data match")
 
         st.divider()
         st.caption("Save & share")
