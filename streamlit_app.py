@@ -1,22 +1,12 @@
-import streamlit as st
-
-st.set_page_config(
-    page_title="Molecular Energy Landscape",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.title("OPTIM-tracker")
-st.write(
-    "Let's start building! For help and inspiration, head over to [docs.streamlit.io](https://docs.streamlit.io/)."
-)
 import os
 import math
 import json
 import tempfile
 import urllib.parse
+import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
+import numpy as np
 
 try:
     import paramiko
@@ -24,6 +14,12 @@ try:
     _PARAMIKO = True
 except ImportError:
     _PARAMIKO = False
+
+st.set_page_config(
+    page_title="Molecular Energy Landscape",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULTS = {
@@ -209,19 +205,40 @@ def merge_path(file_texts):
 # ── Network construction ──────────────────────────────────────────────────────
 
 _MATCH_TOL = 5e-14  # half a unit in the 13th decimal place
+_RMSD_TOL  = 1e-4   # Ångströms — only catches truly identical rotated structures
+
+
+def _kabsch_rmsd(coords_a, coords_b):
+    """RMSD between two coordinate sets after optimal rotation alignment (Kabsch).
+
+    Returns infinity if the atom counts differ.
+    """
+    if len(coords_a) != len(coords_b):
+        return float("inf")
+    A = np.array(coords_a, dtype=float)
+    B = np.array(coords_b, dtype=float)
+    A -= A.mean(axis=0)
+    B -= B.mean(axis=0)
+    H = A.T @ B
+    U, _, Vt = np.linalg.svd(H)
+    # Correct for improper rotation (reflection)
+    d = np.linalg.det(Vt.T @ U.T)
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    diff = (A @ R.T) - B
+    return float(np.sqrt((diff ** 2).sum() / len(A)))
 
 
 def build_network(min_e_base, ts_e, triplets):
-    """Build the edge list and node table from all available data.
+    """Build the edge list, TS node list, and node table from all available data.
 
     Nodes are seeded from min.data (min_e_base). Each path.info structure is
-    matched against the current node list using _MATCH_TOL. If no match exists
-    it is added as a new node, so structures unique to path.info are never lost.
-    Returns (edges, node_coords, all_e) where all_e is the complete energy list
-    including any nodes that came only from path.info.
+    matched first by energy (_MATCH_TOL), then by RMSD after optimal rotation
+    (_RMSD_TOL). Unmatched structures become new nodes.
+    Returns (edges, node_coords, all_e, ts_nodes, n_rmsd_merged).
     """
-    all_e = list(min_e_base)  # grows as unmatched path.info structures are added
+    all_e = list(min_e_base)
     node_coords = {}
+    rmsd_count = [0]
 
     def find_match(e):
         if not all_e:
@@ -229,8 +246,18 @@ def build_network(min_e_base, ts_e, triplets):
         best = min(range(len(all_e)), key=lambda j: abs(all_e[j] - e))
         return best + 1 if abs(all_e[best] - e) <= _MATCH_TOL else None
 
+    def find_rmsd_match(coords):
+        for nid, nc in node_coords.items():
+            if _kabsch_rmsd(nc, coords) <= _RMSD_TOL:
+                return nid
+        return None
+
     def get_or_create(struct):
         nid = find_match(struct["e"])
+        if nid is None and struct.get("c"):
+            nid = find_rmsd_match(struct["c"])
+            if nid is not None:
+                rmsd_count[0] += 1
         if nid is None:
             all_e.append(struct["e"])
             nid = len(all_e)
@@ -238,31 +265,51 @@ def build_network(min_e_base, ts_e, triplets):
             node_coords[nid] = struct["c"]
         return nid
 
-    path_edges = {}
+    # Collect all raw TS entries from both sources
+    raw_ts = []
     for mA, ts, mB in triplets:
         idA = get_or_create(mA)
         idB = get_or_create(mB)
-        key = (min(idA, idB), max(idA, idB))
-        if key not in path_edges:
-            path_edges[key] = {"e": ts["e"], "c": ts["c"]}
+        raw_ts.append((ts["e"], idA, idB, ts.get("c"), "path.info"))
 
-    edges = []
-    for key, info in path_edges.items():
-        edges.append({"idA": key[0], "idB": key[1],
-                      "e": info["e"], "c": info["c"], "source": "path.info"})
-
-    # ts.data: match against full node list (min.data + any path.info additions)
     for ts_energy, ea, eb in ts_e:
         idA = find_match(ea)
         idB = find_match(eb)
         if idA is None or idB is None:
             continue
-        key = (min(idA, idB), max(idA, idB))
-        if key not in path_edges:
-            edges.append({"idA": idA, "idB": idB,
-                          "e": ts_energy, "c": None, "source": "ts.data only"})
+        raw_ts.append((ts_energy, idA, idB, None, "ts.data only"))
 
-    return edges, node_coords, all_e
+    # Group TS entries by energy within _MATCH_TOL → one ts_node per unique TS
+    ts_nodes = []
+
+    def find_ts_group(e):
+        for i, grp in enumerate(ts_nodes):
+            if abs(grp["e"] - e) <= _MATCH_TOL:
+                return i
+        return None
+
+    for ts_e_val, idA, idB, coords, source in raw_ts:
+        pair = (min(idA, idB), max(idA, idB))
+        gi = find_ts_group(ts_e_val)
+        if gi is None:
+            ts_nodes.append({"e": ts_e_val, "c": coords, "source": source,
+                              "pairs": [pair]})
+        else:
+            if pair not in ts_nodes[gi]["pairs"]:
+                ts_nodes[gi]["pairs"].append(pair)
+            if coords and not ts_nodes[gi]["c"]:
+                ts_nodes[gi]["c"] = coords
+            if source == "path.info":
+                ts_nodes[gi]["source"] = "path.info"
+
+    # Flat edge list for energy profiles and summary counts
+    edges = []
+    for tsn in ts_nodes:
+        for pair in tsn["pairs"]:
+            edges.append({"idA": pair[0], "idB": pair[1],
+                          "e": tsn["e"], "c": tsn["c"], "source": tsn["source"]})
+
+    return edges, node_coords, all_e, ts_nodes, rmsd_count[0]
 
 
 # ── Layout ────────────────────────────────────────────────────────────────────
@@ -410,16 +457,18 @@ def build_3d_viewer_html(coords, element, height=300):
 
 # ── Draggable SVG diagram ─────────────────────────────────────────────────────
 
-def build_draggable_html(min_e, edges, node_coords, pos):
+def build_draggable_html(min_e, ts_nodes, node_coords, pos):
     """Return a self-contained HTML page: SVG diagram with drag-and-drop nodes.
 
-    Positions live in JavaScript; dragging does not trigger a Streamlit rerun.
-    The RESET button inside the diagram restores all nodes to their original
-    positions without any page reload.
+    Transition states are rendered as diamonds at the centroid of their connected
+    minima. Lines radiate from each diamond to every minimum it connects. Identical
+    TS from different sources share one diamond, so lines from all their minima
+    converge on the same point.
     """
     e_lo, e_hi = min(min_e), max(min_e)
-    te_lo = min((ed["e"] for ed in edges), default=0.0)
-    te_hi = max((ed["e"] for ed in edges), default=0.0)
+    ts_e_all = [tsn["e"] for tsn in ts_nodes]
+    te_lo = min(ts_e_all, default=0.0)
+    te_hi = max(ts_e_all, default=0.0)
 
     nodes_data = []
     for idx, e in enumerate(min_e, start=1):
@@ -436,19 +485,18 @@ def build_draggable_html(min_e, edges, node_coords, pos):
             "hasCoords": idx in node_coords,
         })
 
-    edges_data = []
-    for ed in edges:
-        if ed["idA"] not in pos or ed["idB"] not in pos:
+    ts_data = []
+    for tsn in ts_nodes:
+        valid_pairs = [[a, b] for a, b in tsn["pairs"] if a in pos and b in pos]
+        if not valid_pairs:
             continue
-        edges_data.append({
-            "idA": ed["idA"],
-            "idB": ed["idB"],
-            "color": edge_col(ed["e"], te_lo, te_hi, ed["source"]),
-            "energy": f"{ed['e']:.14f}",
-            "source": ed["source"],
+        ts_data.append({
+            "e": f"{tsn['e']:.14f}",
+            "source": tsn["source"],
+            "color": edge_col(tsn["e"], te_lo, te_hi, tsn["source"]),
+            "pairs": valid_pairs,
         })
 
-    # Use a raw string + .replace() to inject JSON without escaping every brace
     template = r"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -460,7 +508,7 @@ body{background:#0f0f1a;overflow:hidden;font-family:sans-serif}
 #bar label{color:#999;font-size:12px;user-select:none;cursor:pointer}
 #tip{position:fixed;display:none;background:rgba(0,0,0,.9);color:#e0e0e0;
   border:1px solid #555;border-radius:4px;padding:6px 10px;font-size:11px;
-  pointer-events:none;line-height:1.7;z-index:50;max-width:280px}
+  pointer-events:none;line-height:1.7;z-index:50;max-width:300px}
 svg{display:block;width:100%;height:700px}
 </style></head>
 <body>
@@ -470,39 +518,58 @@ svg{display:block;width:100%;height:700px}
 </div>
 <div id="tip"></div>
 <svg id="g" viewBox="0 0 940 940" preserveAspectRatio="xMidYMid meet">
-  <g id="eG"></g><g id="lG"></g><g id="nG"></g>
+  <g id="eG"></g><g id="lG"></g><g id="tG"></g><g id="nG"></g>
 </svg>
 <script>
 const NS='http://www.w3.org/2000/svg';
 const NODES=__NODES__;
-const EDGES=__EDGES__;
+const TS=__TS__;
 const orig={};NODES.forEach(n=>orig[n.id]={x:n.x,y:n.y});
 const P={};NODES.forEach(n=>P[n.id]={x:n.x,y:n.y});
 const svg=document.getElementById('g');
-const eG=document.getElementById('eG'),lG=document.getElementById('lG'),nG=document.getElementById('nG');
+const eG=document.getElementById('eG'),lG=document.getElementById('lG');
+const tG=document.getElementById('tG'),nG=document.getElementById('nG');
 const tip=document.getElementById('tip');
 let showL=false,drag=null,ds=null;
 
-// Build edge elements
-const eEls=[],lEls=[];
-EDGES.forEach(ed=>{
-  const ln=document.createElementNS(NS,'line');
-  ln.setAttribute('stroke',ed.color);ln.setAttribute('stroke-width','1.8');
-  eG.appendChild(ln);
-  const hit=document.createElementNS(NS,'line');
-  hit.setAttribute('stroke','transparent');hit.setAttribute('stroke-width','16');
-  hit.addEventListener('mouseenter',ev=>showTip(ev,'Transition state\nEnergy: '+ed.energy+'\nNodes: '+ed.idA+' ↔ '+ed.idB+'\nSource: '+ed.source));
-  hit.addEventListener('mousemove',moveTip);hit.addEventListener('mouseleave',hideTip);
-  eG.appendChild(hit);eEls.push({ln,hit});
+// Build TS elements: one line per connected minimum + a diamond at the centroid
+const tsEls=[];
+TS.forEach(ts=>{
+  const uMins=new Set();
+  ts.pairs.forEach(p=>{uMins.add(p[0]);uMins.add(p[1]);});
+  const pStr=ts.pairs.map(p=>p[0]+' ↔ '+p[1]).join(', ');
+  const tipTxt='Transition state\nEnergy: '+ts.e+'\nConnects: '+pStr+'\nSource: '+ts.source;
+  const lines=[];
+  uMins.forEach(mid=>{
+    const ln=document.createElementNS(NS,'line');
+    ln.setAttribute('stroke',ts.color);ln.setAttribute('stroke-width','1.8');
+    eG.appendChild(ln);
+    const hit=document.createElementNS(NS,'line');
+    hit.setAttribute('stroke','transparent');hit.setAttribute('stroke-width','14');
+    hit.addEventListener('mouseenter',ev=>showTip(ev,tipTxt));
+    hit.addEventListener('mousemove',moveTip);hit.addEventListener('mouseleave',hideTip);
+    eG.appendChild(hit);
+    lines.push({ln,hit,mid});
+  });
   const tx=document.createElementNS(NS,'text');
   tx.setAttribute('font-size','8');tx.setAttribute('fill','#666');
   tx.setAttribute('text-anchor','middle');tx.setAttribute('dominant-baseline','middle');
   tx.setAttribute('pointer-events','none');
-  tx.textContent=parseFloat(ed.energy).toExponential(3);
-  lG.appendChild(tx);lEls.push(tx);
+  tx.textContent=parseFloat(ts.e).toExponential(3);
+  lG.appendChild(tx);
+  const poly=document.createElementNS(NS,'polygon');
+  poly.setAttribute('fill',ts.color);poly.setAttribute('stroke','white');
+  poly.setAttribute('stroke-width','1.5');
+  tG.appendChild(poly);
+  const hitP=document.createElementNS(NS,'polygon');
+  hitP.setAttribute('fill','transparent');hitP.setAttribute('stroke','transparent');
+  hitP.addEventListener('mouseenter',ev=>showTip(ev,tipTxt));
+  hitP.addEventListener('mousemove',moveTip);hitP.addEventListener('mouseleave',hideTip);
+  tG.appendChild(hitP);
+  tsEls.push({lines,poly,hitP,tx});
 });
 
-// Build node elements
+// Build min node elements
 const nEls={};
 NODES.forEach(n=>{
   const g=document.createElementNS(NS,'g');g.style.cursor='grab';
@@ -521,17 +588,30 @@ NODES.forEach(n=>{
   nG.appendChild(g);nEls[n.id]=g;
 });
 
-// Position all elements
+function tsCenter(ts){
+  const uMins=new Set();ts.pairs.forEach(p=>{uMins.add(p[0]);uMins.add(p[1]);});
+  let sx=0,sy=0,n=0;
+  uMins.forEach(mid=>{if(P[mid]){sx+=P[mid].x;sy+=P[mid].y;n++;}});
+  return n>0?{x:sx/n,y:sy/n}:null;
+}
+function dPts(cx,cy,s){
+  return cx+','+(cy-s)+' '+(cx+s)+','+cy+' '+cx+','+(cy+s)+' '+(cx-s)+','+cy;
+}
+
 function redraw(){
-  EDGES.forEach((ed,i)=>{
-    const a=P[ed.idA],b=P[ed.idB];if(!a||!b)return;
-    const el=eEls[i];
-    el.ln.setAttribute('x1',a.x);el.ln.setAttribute('y1',a.y);
-    el.ln.setAttribute('x2',b.x);el.ln.setAttribute('y2',b.y);
-    el.hit.setAttribute('x1',a.x);el.hit.setAttribute('y1',a.y);
-    el.hit.setAttribute('x2',b.x);el.hit.setAttribute('y2',b.y);
-    lEls[i].setAttribute('x',(a.x+b.x)/2);lEls[i].setAttribute('y',(a.y+b.y)/2);
-    lEls[i].style.display=showL?'':'none';
+  TS.forEach((ts,i)=>{
+    const tp=tsCenter(ts);const el=tsEls[i];if(!tp)return;
+    el.lines.forEach(({ln,hit,mid})=>{
+      const mp=P[mid];if(!mp)return;
+      ln.setAttribute('x1',mp.x);ln.setAttribute('y1',mp.y);
+      ln.setAttribute('x2',tp.x);ln.setAttribute('y2',tp.y);
+      hit.setAttribute('x1',mp.x);hit.setAttribute('y1',mp.y);
+      hit.setAttribute('x2',tp.x);hit.setAttribute('y2',tp.y);
+    });
+    el.tx.setAttribute('x',tp.x);el.tx.setAttribute('y',tp.y-14);
+    el.tx.style.display=showL?'':'none';
+    el.poly.setAttribute('points',dPts(tp.x,tp.y,8));
+    el.hitP.setAttribute('points',dPts(tp.x,tp.y,14));
   });
   NODES.forEach(n=>{
     const p=P[n.id];if(!p)return;
@@ -540,7 +620,6 @@ function redraw(){
 }
 redraw();
 
-// Drag handling
 function svgPt(e){
   const pt=svg.createSVGPoint();pt.x=e.clientX;pt.y=e.clientY;
   return pt.matrixTransform(svg.getScreenCTM().inverse());
@@ -566,13 +645,11 @@ svg.addEventListener('mouseleave',onUp);
 svg.addEventListener('touchmove',e=>{e.preventDefault();onMove(e);},{passive:false});
 svg.addEventListener('touchend',onUp);
 
-// Controls
 document.getElementById('rst').addEventListener('click',()=>{
   NODES.forEach(n=>{P[n.id]={x:orig[n.id].x,y:orig[n.id].y};});redraw();
 });
 document.getElementById('lbl').addEventListener('change',e=>{showL=e.target.checked;redraw();});
 
-// Tooltip
 function showTip(e,txt){
   tip.innerHTML=txt.replace(/\n/g,'<br>');tip.style.display='block';moveTip(e);
 }
@@ -582,7 +659,7 @@ function hideTip(){tip.style.display='none';}
 
     return (template
             .replace("__NODES__", json.dumps(nodes_data))
-            .replace("__EDGES__", json.dumps(edges_data)))
+            .replace("__TS__", json.dumps(ts_data)))
 
 
 # ── Energy profile line charts ───────────────────────────────────────────────
@@ -647,15 +724,26 @@ def find_component_paths(edges, min_e):
     return components, isolated
 
 
-def build_single_path_fig(path, comp_nodes):
-    """Build a Plotly figure for one chain."""
+def build_single_path_fig(path, comp_nodes, all_min_e):
+    """Build a Plotly energy profile for one chain.
+
+    Minima are coloured with the same blue-to-red gradient as the spider web.
+    TS are shown as grey diamonds. A spline connects all points.
+    """
+    e_lo, e_hi = min(all_min_e), max(all_min_e)
     y_vals = [item[1] for item in path]
     x_vals = list(range(len(path)))
-    hover = []
+    colors, symbols, sizes, hover = [], [], [], []
     for item in path:
         if item[0] == "M":
+            colors.append(node_col(item[1], e_lo, e_hi))
+            symbols.append("circle")
+            sizes.append(14)
             hover.append(f"Node {item[2]}<br>E = {item[1]:.14f}")
         else:
+            colors.append("#999999")
+            symbols.append("diamond")
+            sizes.append(9)
             hover.append(f"TS {item[2]} ↔ {item[3]}<br>E = {item[1]:.14f}")
     tick_text = [f"Node {p[2]}" if p[0] == "M" else "TS" for p in path]
     node_list = " · ".join(str(n) for n in comp_nodes[:12])
@@ -664,34 +752,49 @@ def build_single_path_fig(path, comp_nodes):
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=x_vals, y=y_vals,
-        mode="lines+markers",
+        mode="lines",
         showlegend=False,
-        line=dict(color="#7ec8e3", width=2),
+        line=dict(color="#2a3a5e", width=2, shape="spline", smoothing=0.6),
+        hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_vals, y=y_vals,
+        mode="markers",
+        showlegend=False,
         marker=dict(
-            size=[10 if p[0] == "M" else 7 for p in path],
-            symbol=["circle" if p[0] == "M" else "diamond" for p in path],
-            color="#7ec8e3",
+            size=sizes,
+            symbol=symbols,
+            color=colors,
+            line=dict(color="white", width=1),
         ),
         hovertext=hover,
         hoverinfo="text",
     ))
     fig.update_layout(
         paper_bgcolor="#0f0f1a",
-        plot_bgcolor="#111128",
+        plot_bgcolor="#0a0a18",
         font=dict(color="#e0e0e0"),
-        title=dict(text=f"Nodes: {node_list}", font=dict(size=12, color="#888")),
+        title=dict(text=f"Nodes: {node_list}", font=dict(size=12, color="#667799")),
         xaxis=dict(
-            title="Step along pathway",
+            title="",
             tickmode="array",
             tickvals=list(range(len(tick_text))),
             ticktext=tick_text,
             tickangle=45,
-            gridcolor="#222244",
+            gridcolor="#1a1a30",
             showgrid=True,
+            tickfont=dict(size=10, color="#667799"),
+            zeroline=False,
         ),
-        yaxis=dict(title="Energy", gridcolor="#222244", showgrid=True),
+        yaxis=dict(
+            title="Energy",
+            gridcolor="#1a1a30",
+            showgrid=True,
+            zeroline=False,
+        ),
         margin=dict(l=70, r=20, t=50, b=90),
         height=420,
+        hovermode="closest",
     )
     return fig
 
@@ -714,83 +817,17 @@ def show_merge_stats(label, stats, n_unique):
 
 def main():
     # ── Sidebar: file uploads ──
+    if "show_guide" not in st.session_state:
+        st.session_state["show_guide"] = False
+
     with st.sidebar:
-        with st.expander("User Guide", expanded=False):
-            st.markdown("### Loading your files")
-            st.markdown(
-                """
-**min.data** and **ts.data** can be loaded in two ways:
-- Copy them from the Linux server using the **SCP connection** panel below.
-- Copy the file contents into a text file (e.g. Notepad) and upload it using the file uploaders.
-
-**path.info** should be copied directly from the Linux server using SCP.
-The file is too large to copy and paste by hand without risk of truncation.
-
-You can upload more than one file into each slot. Duplicates are removed automatically.
-"""
-            )
-            st.markdown("### The spider web diagram")
-            st.markdown(
-                """
-- Each **circle (node)** is a minimum energy structure.
-- Each **line (edge)** is a transition state connecting two minima.
-- The longest chain in the network is always placed along the vertical centre.
-- **Nodes are draggable** — click and drag any node to reposition it.
-- Click **RESET** inside the diagram to restore original positions.
-- Tick **TS labels** to show transition state energies on each edge.
-- Hover over any node or edge to see its energy.
-"""
-            )
-            st.markdown("### Node colours")
-            st.markdown(
-                """
-<div style='margin:6px 0 4px'>
-  <div style='
-    background:linear-gradient(to right,
-      rgb(0,60,220),rgb(0,210,220),rgb(0,200,50),rgb(220,210,0),rgb(220,0,0));
-    height:12px;border-radius:4px;
-  '></div>
-  <div style='display:flex;justify-content:space-between;font-size:11px;color:#aaa;margin-top:3px'>
-    <span>Stable</span><span>Metastable</span>
-  </div>
-</div>
-
-- **Green border** — 3D coordinates available from path.info.
-- No green border — PATHSAMPLE-only node; energy shown but no 3D structure.
-""",
-                unsafe_allow_html=True,
-            )
-            st.markdown("### Selecting a node")
-            st.markdown(
-                """
-Use the **Select node** dropdown on the right of the spider web.
-
-- The node's energy is always shown.
-- If the node has a **green border**, a 3D molecular viewer appears.
-- Rotate and zoom the 3D structure using your mouse.
-- Change the atom element symbol in the sidebar (default: Au).
-"""
-            )
-            st.markdown("### Other tabs")
-            st.markdown(
-                """
-| Tab | What it shows |
-|---|---|
-| **min.data energies** | All minimum energies with a bar chart. |
-| **ts.data energies** | Transition state energies and connected nodes. |
-| **path.info** | Triplets: min A, transition state, min B. |
-| **Energy profiles** | Energy plotted along each connected pathway. |
-"""
-            )
-            st.markdown("### Saving and sharing")
-            st.markdown(
-                """
-- **Quick save** downloads the session as a JSON file.
-- **Save as** lets you name the file first.
-- **Share via email** opens a pre-filled email — attach the saved JSON file.
-- Reload a session using **Load saved session** below.
-"""
-            )
+        guide_open = st.session_state["show_guide"]
+        if st.button(
+            "Close Guide" if guide_open else "User Guide",
+            use_container_width=True,
+        ):
+            st.session_state["show_guide"] = not guide_open
+            st.rerun()
 
         st.divider()
         st.title("Compress")
@@ -966,6 +1003,99 @@ Use the **Select node** dropdown on the right of the spider web.
             unsafe_allow_html=True,
         )
 
+    # ── User Guide overlay ──
+    if st.session_state.get("show_guide", False):
+        st.subheader("User Guide")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("### Loading your files")
+            st.markdown(
+                """
+**min.data** and **ts.data** can be loaded in two ways:
+- Copy them from the Linux server using the **SCP connection** panel in the sidebar.
+- Copy the file contents into a text file (e.g. Notepad) and upload it using the file uploaders.
+
+**path.info** should be copied directly from the Linux server using SCP.
+The file is too large to copy and paste by hand without risk of truncation.
+
+You can upload more than one file into each slot. Duplicates are removed automatically.
+"""
+            )
+            st.markdown("### The spider web diagram")
+            st.markdown(
+                """
+- Each **circle (node)** is a minimum energy structure.
+- Each **diamond** in the diagram is a transition state.
+- Lines radiate from each diamond to the minima it connects.
+- The longest chain in the network is always placed along the vertical centre.
+- **Nodes are draggable** — click and drag any node to reposition it.
+- Click **RESET** inside the diagram to restore original positions.
+- Tick **TS labels** to show transition state energies.
+- Hover over any node, diamond, or line to see its energy.
+"""
+            )
+            st.markdown("### Node colours")
+            st.markdown(
+                """
+<div style='margin:6px 0 4px'>
+  <div style='
+    background:linear-gradient(to right,
+      rgb(0,60,220),rgb(0,210,220),rgb(0,200,50),rgb(220,210,0),rgb(220,0,0));
+    height:14px;border-radius:4px;
+  '></div>
+  <div style='display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-top:4px'>
+    <span>Stable (lowest energy)</span><span>Metastable (highest energy)</span>
+  </div>
+</div>
+
+- **Green border** — 3D coordinates available from path.info.
+- No green border — PATHSAMPLE-only node; energy shown but no 3D structure.
+""",
+                unsafe_allow_html=True,
+            )
+        with col_b:
+            st.markdown("### Selecting a node")
+            st.markdown(
+                """
+Use the **Select node** dropdown on the right of the spider web.
+
+- The node's energy is always shown.
+- If the node has a **green border**, a 3D molecular viewer appears below.
+- Rotate and zoom the 3D structure using your mouse.
+- Change the atom element symbol in the sidebar (default: Au).
+"""
+            )
+            st.markdown("### Other tabs")
+            st.markdown(
+                """
+| Tab | What it shows |
+|---|---|
+| **min.data energies** | All minimum energies and a bar chart. |
+| **ts.data energies** | Transition state energies and connected nodes. |
+| **path.info** | Triplets: min A, transition state, min B. |
+| **Energy profiles** | Energy plotted along each connected pathway. Node colours match the spider web. |
+"""
+            )
+            st.markdown("### Saving and sharing")
+            st.markdown(
+                """
+- **Quick save** in the sidebar downloads the session as a JSON file.
+- **Save as** lets you name the file first.
+- **Share via email** opens a pre-filled email — attach the saved JSON file.
+- Reload a previous session using **Load saved session** in the sidebar.
+"""
+            )
+            st.markdown("### Multiple runs")
+            st.markdown(
+                """
+The sidebar has six independent slots: **0, −1, −2, −3, −4, −5**.
+
+Each slot holds its own files and session state.
+Switch between slots to load different runs side by side without losing any data.
+"""
+            )
+        return
+
     # ── Load and merge ──
     min_files  = read_files(up_min,  "min.data",  folder)
     ts_files   = read_files(up_ts,   "ts.data",   folder)
@@ -979,7 +1109,7 @@ Use the **Select node** dropdown on the right of the spider web.
     ts_e,       ts_parts,  ts_stats  = merge_ts(ts_files, min_files) if ts_files else ([], [], [])
     triplets,   path_stats            = merge_path(path_files) if path_files else ([], [])
 
-    edges, node_coords, min_e = build_network(min_e_base, ts_e, triplets)
+    edges, node_coords, min_e, ts_nodes, n_rmsd_merged = build_network(min_e_base, ts_e, triplets)
     n_path_only = len(min_e) - len(min_e_base)
 
     edge_tuples = tuple((ed["idA"], ed["idB"]) for ed in edges)
@@ -995,6 +1125,8 @@ Use the **Select node** dropdown on the right of the spider web.
         show_merge_stats("path.info", path_stats, len(triplets))
         if n_path_only:
             st.caption(f"{n_path_only} node(s) added from path.info with no min.data match")
+        if n_rmsd_merged:
+            st.caption(f"{n_rmsd_merged} node(s) merged by rotation alignment (RMSD ≤ {_RMSD_TOL:.0e} Å)")
 
         st.divider()
         st.caption("Save & share")
@@ -1106,7 +1238,7 @@ Use the **Select node** dropdown on the right of the spider web.
 
         with graph_col:
             st.components.v1.html(
-                build_draggable_html(min_e, edges, node_coords, pos),
+                build_draggable_html(min_e, ts_nodes, node_coords, pos),
                 height=720,
                 scrolling=False,
             )
@@ -1333,9 +1465,10 @@ Use the **Select node** dropdown on the right of the spider web.
                     key=f"ep_chain_{folder}_{ci}",
                 )
                 st.plotly_chart(
-                    build_single_path_fig(paths[path_idx - 1], comp_nodes),
+                    build_single_path_fig(paths[path_idx - 1], comp_nodes, min_e),
                     use_container_width=True,
                 )
+
 
 
 main()
