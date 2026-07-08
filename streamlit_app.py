@@ -65,10 +65,14 @@ def parse_min(text):
         p = line.split()
         if p:
             try:
-                result.append((float(p[0]), line))
+                e = float(p[0])
+                Ix = float(p[3]) if len(p) > 3 else None
+                Iy = float(p[4]) if len(p) > 4 else None
+                Iz = float(p[5]) if len(p) > 5 else None
+                result.append((e, Ix, Iy, Iz, line))
             except ValueError:
                 pass
-    return result   # list of (energy, original_line)
+    return result   # list of (energy, Ix, Iy, Iz, original_line)
 
 
 @st.cache_data(show_spinner=False)
@@ -123,16 +127,27 @@ def parse_path(text):
 
 # ── Merge and deduplication ───────────────────────────────────────────────────
 
+_MOI_DP = 4   # decimal places for moment-of-inertia deduplication
+
 def merge_min(file_texts):
-    """Combine min.data from multiple files; dedup by full-precision energy."""
-    seen = {}       # energy -> (energy, original_line)
+    """Combine min.data from multiple files; dedup by energy + moments of inertia.
+
+    Two entries are duplicates only if their energy matches exactly AND all three
+    principal moments of inertia agree to _MOI_DP decimal places (≈ 5e-5 tolerance).
+    Files that omit the moment columns fall back to energy-only deduplication.
+    """
+    seen = {}       # key -> (energy, original_line)
     stats = []
     for fname, text in file_texts:
-        entries = parse_min(text)   # list of (energy, line)
+        entries = parse_min(text)   # list of (energy, Ix, Iy, Iz, line)
         added = dup = 0
-        for e, line in entries:
-            if e not in seen:
-                seen[e] = (e, line)
+        for e, Ix, Iy, Iz, line in entries:
+            if Ix is not None and Iy is not None and Iz is not None:
+                key = (e, round(Ix, _MOI_DP), round(Iy, _MOI_DP), round(Iz, _MOI_DP))
+            else:
+                key = (e,)
+            if key not in seen:
+                seen[key] = (e, line)
                 added += 1
             else:
                 dup += 1
@@ -162,7 +177,7 @@ def merge_ts(ts_file_texts, min_file_texts):
     merged = []     # (ts_energy, min_a_energy, min_b_energy, all_parts)
     stats = []
     for i, (fname, text) in enumerate(ts_file_texts):
-        local_min = min_parsed[min(i, len(min_parsed) - 1)]  # list of (energy, line)
+        local_min = min_parsed[min(i, len(min_parsed) - 1)]  # list of (energy, Ix, Iy, Iz, line)
         raw = parse_ts(text)
         added = dup = 0
         for ts_e_val, raw_a, raw_b, parts in raw:
