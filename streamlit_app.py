@@ -56,6 +56,17 @@ def read_files(uploaded_list, key, folder="0"):
     return results
 
 
+def read_binary_files(uploaded_list, key, folder="0"):
+    """Return list of (filename, bytes) from uploads or SSH binary fetch."""
+    results = []
+    for f in (uploaded_list or []):
+        results.append((f.name, f.read()))
+    ssh_binary = st.session_state.get(f"ssh_binary_{folder}", {})
+    if key in ssh_binary:
+        results.append(ssh_binary[key])
+    return results
+
+
 # ── Parsers ───────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
@@ -197,6 +208,56 @@ def merge_ts(ts_file_texts, min_file_texts):
     return ts_tuples, ts_parts, stats
 
 
+def parse_points_binary(raw_bytes, n_atoms):
+    """Parse a Fortran binary coordinate file into a list of coordinate blocks.
+
+    Returns a list (one entry per structure) of [[x, y, z], ...] coordinate lists.
+    Structures are 0-indexed. Returns an empty list if the byte count does not
+    divide evenly by n_atoms * 3 * 8.
+    """
+    import struct
+    n_doubles = len(raw_bytes) // 8
+    doubles = struct.unpack_from(f"<{n_doubles}d", raw_bytes)
+    n_per = n_atoms * 3
+    if n_per == 0 or n_doubles % n_per != 0:
+        return []
+    n_structs = n_doubles // n_per
+    result = []
+    for s in range(n_structs):
+        base = s * n_per
+        result.append([
+            [doubles[base + a * 3], doubles[base + a * 3 + 1], doubles[base + a * 3 + 2]]
+            for a in range(n_atoms)
+        ])
+    return result
+
+
+def convert_points_binary(raw_bytes, n_atoms):
+    """Convert a Fortran unformatted binary coordinate file to plain text.
+
+    Returns (text, n_structures). Each structure is written as a numbered header
+    followed by one 'x  y  z' line per atom.
+    """
+    import struct
+    n_doubles = len(raw_bytes) // 8
+    doubles = struct.unpack_from(f"<{n_doubles}d", raw_bytes)
+    n_per = n_atoms * 3
+    if n_per == 0 or n_doubles % n_per != 0:
+        return None, 0
+    n_structs = n_doubles // n_per
+    lines = []
+    for s in range(n_structs):
+        base = s * n_per
+        lines.append(f"# Structure {s + 1}  ({n_atoms} atoms)")
+        for a in range(n_atoms):
+            x = doubles[base + a * 3]
+            y = doubles[base + a * 3 + 1]
+            z = doubles[base + a * 3 + 2]
+            lines.append(f"  {x:20.10f}  {y:20.10f}  {z:20.10f}")
+        lines.append("")
+    return "\n".join(lines), n_structs
+
+
 def merge_path(file_texts):
     """Combine path.info from multiple files; dedup triplets by TS energy."""
     seen = set()
@@ -243,16 +304,24 @@ def _kabsch_rmsd(coords_a, coords_b):
     return float(np.sqrt((diff ** 2).sum() / len(A)))
 
 
-def build_network(min_e_base, ts_e, triplets):
+def build_network(min_e_base, ts_e, triplets, min_coords_base=None, ts_coords_base=None):
     """Build the edge list, TS node list, and node table from all available data.
 
-    Nodes are seeded from min.data (min_e_base). Each path.info structure is
-    matched first by energy (_MATCH_TOL), then by RMSD after optimal rotation
-    (_RMSD_TOL). Unmatched structures become new nodes.
-    Returns (edges, node_coords, all_e, ts_nodes, n_rmsd_merged).
+    Nodes are seeded from min.data (min_e_base). If min_coords_base is supplied
+    (dict mapping 1-based min.data index → [[x,y,z],...]) those coordinates are
+    attached during seeding, enabling RMSD deduplication against path.info structures.
+    Each path.info structure is matched first by energy (_MATCH_TOL), then by RMSD
+    after optimal rotation (_RMSD_TOL). Unmatched structures become new nodes.
+
+    ts_coords_base -- dict mapping 0-based ts_e index → [[x,y,z],...] from points.ts.
+    TS deduplication also checks RMSD when coordinates are available.
+
+    Returns (edges, node_coords, all_e, ts_nodes, n_rmsd_merged, node_coord_sources)
+    where node_coord_sources maps node_id → "path.info" | "points.min".
     """
-    all_e = list(min_e_base)
+    all_e = []
     node_coords = {}
+    node_coord_sources = {}
     rmsd_count = [0]
 
     def find_match(e):
@@ -267,7 +336,7 @@ def build_network(min_e_base, ts_e, triplets):
                 return nid
         return None
 
-    def get_or_create(struct):
+    def get_or_create(struct, coord_source="path.info"):
         nid = find_match(struct["e"])
         if nid is None and struct.get("c"):
             nid = find_rmsd_match(struct["c"])
@@ -278,7 +347,15 @@ def build_network(min_e_base, ts_e, triplets):
             nid = len(all_e)
         if struct.get("c") and nid not in node_coords:
             node_coords[nid] = struct["c"]
+            node_coord_sources[nid] = coord_source
         return nid
+
+    # Seed from min.data; RMSD deduplication is active when coordinates are provided,
+    # enabling cross-source merging with path.info and points.min structures.
+    for i, e in enumerate(min_e_base, start=1):
+        coords = (min_coords_base or {}).get(i)
+        get_or_create({"e": e, "c": coords},
+                      coord_source="points.min" if coords else "min.data")
 
     # Collect all raw TS entries from both sources
     raw_ts = []
@@ -287,25 +364,28 @@ def build_network(min_e_base, ts_e, triplets):
         idB = get_or_create(mB)
         raw_ts.append((ts["e"], idA, idB, ts.get("c"), "path.info"))
 
-    for ts_energy, ea, eb in ts_e:
+    for j, (ts_energy, ea, eb) in enumerate(ts_e):
         idA = find_match(ea)
         idB = find_match(eb)
         if idA is None or idB is None:
             continue
-        raw_ts.append((ts_energy, idA, idB, None, "ts.data only"))
+        coords = (ts_coords_base or {}).get(j)
+        raw_ts.append((ts_energy, idA, idB, coords, "ts.data only"))
 
-    # Group TS entries by energy within _MATCH_TOL → one ts_node per unique TS
+    # Group TS entries by energy within _MATCH_TOL or by RMSD → one ts_node per unique TS
     ts_nodes = []
 
-    def find_ts_group(e):
+    def find_ts_group(e, coords=None):
         for i, grp in enumerate(ts_nodes):
             if abs(grp["e"] - e) <= _MATCH_TOL:
+                return i
+            if coords and grp["c"] and _kabsch_rmsd(grp["c"], coords) <= _RMSD_TOL:
                 return i
         return None
 
     for ts_e_val, idA, idB, coords, source in raw_ts:
         pair = (min(idA, idB), max(idA, idB))
-        gi = find_ts_group(ts_e_val)
+        gi = find_ts_group(ts_e_val, coords)
         if gi is None:
             ts_nodes.append({"e": ts_e_val, "c": coords, "source": source,
                               "pairs": [pair]})
@@ -324,7 +404,7 @@ def build_network(min_e_base, ts_e, triplets):
             edges.append({"idA": pair[0], "idB": pair[1],
                           "e": tsn["e"], "c": tsn["c"], "source": tsn["source"]})
 
-    return edges, node_coords, all_e, ts_nodes, rmsd_count[0]
+    return edges, node_coords, all_e, ts_nodes, rmsd_count[0], node_coord_sources
 
 
 # ── Layout ────────────────────────────────────────────────────────────────────
@@ -472,13 +552,13 @@ def build_3d_viewer_html(coords, element, height=300):
 
 # ── Draggable SVG diagram ─────────────────────────────────────────────────────
 
-def build_draggable_html(min_e, ts_nodes, node_coords, pos):
-    """Return a self-contained HTML page: SVG diagram with drag-and-drop nodes.
+def build_draggable_html(min_e, ts_nodes, node_coords, pos, element="Au"):
+    """Return a self-contained HTML page: SVG diagram with drag-and-drop nodes
+    and an inline 3D viewer that opens when a node or transition state is clicked.
 
     Transition states are rendered as diamonds at the centroid of their connected
-    minima. Lines radiate from each diamond to every minimum it connects. Identical
-    TS from different sources share one diamond, so lines from all their minima
-    converge on the same point.
+    minima. Clicking any circle or diamond opens a detail panel below the diagram
+    showing the energy and (when coordinates are available) a 3Dmol.js viewer.
     """
     e_lo, e_hi = min(min_e), max(min_e)
     ts_e_all = [tsn["e"] for tsn in ts_nodes]
@@ -498,6 +578,7 @@ def build_draggable_html(min_e, ts_nodes, node_coords, pos):
             "stroke": "#00ff00" if idx in node_coords else "white",
             "energy": f"{e:.14f}",
             "hasCoords": idx in node_coords,
+            "coords": node_coords.get(idx),   # [[x,y,z],...] or null
         })
 
     ts_data = []
@@ -510,12 +591,16 @@ def build_draggable_html(min_e, ts_nodes, node_coords, pos):
             "source": tsn["source"],
             "color": edge_col(tsn["e"], te_lo, te_hi, tsn["source"]),
             "pairs": valid_pairs,
+            "c": tsn["c"],                     # [[x,y,z],...] or null
         })
 
     template = r"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><style>
+<html><head><meta charset="utf-8">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.0.3/3Dmol-min.js"></script>
+<style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0f0f1a;overflow:hidden;font-family:sans-serif}
+body{background:#0f0f1a;font-family:sans-serif;overflow-y:auto}
+#svgwrap{position:relative}
 #bar{position:absolute;top:6px;right:8px;display:flex;gap:8px;align-items:center;z-index:10}
 #bar button{background:#1a1a2e;color:#ccc;border:1px solid #555;padding:3px 12px;
   border-radius:4px;cursor:pointer;font-size:12px;letter-spacing:.3px}
@@ -524,36 +609,100 @@ body{background:#0f0f1a;overflow:hidden;font-family:sans-serif}
 #tip{position:fixed;display:none;background:rgba(0,0,0,.9);color:#e0e0e0;
   border:1px solid #555;border-radius:4px;padding:6px 10px;font-size:11px;
   pointer-events:none;line-height:1.7;z-index:50;max-width:300px}
-svg{display:block;width:100%;height:700px}
+svg{display:block;width:100%;height:480px}
+#detail{border-top:1px solid #2a2a4e;padding:8px 10px;min-height:40px}
+#detail-row{display:flex;justify-content:space-between;align-items:flex-start}
+#detail-info{color:#999;font-size:12px;line-height:1.8;flex:1}
+#detail-info b{color:#ccc}
+#close-btn{background:none;border:1px solid #444;color:#777;padding:1px 8px;
+  border-radius:3px;cursor:pointer;font-size:11px;display:none;flex-shrink:0;margin-left:8px}
+#close-btn:hover{color:#ccc;border-color:#888}
+#v3d{width:100%;height:260px;position:relative;background:#0a0a18;
+  border-radius:4px;margin-top:8px;display:none}
 </style></head>
 <body>
-<div id="bar">
-  <button id="rst">RESET</button>
-  <label><input type="checkbox" id="lbl">&nbsp;TS labels</label>
+<div id="svgwrap">
+  <div id="bar">
+    <button id="rst">RESET</button>
+    <label><input type="checkbox" id="lbl">&nbsp;TS labels</label>
+  </div>
+  <div id="tip"></div>
+  <svg id="g" viewBox="0 0 940 940" preserveAspectRatio="xMidYMid meet">
+    <g id="eG"></g><g id="lG"></g><g id="tG"></g><g id="nG"></g>
+  </svg>
 </div>
-<div id="tip"></div>
-<svg id="g" viewBox="0 0 940 940" preserveAspectRatio="xMidYMid meet">
-  <g id="eG"></g><g id="lG"></g><g id="tG"></g><g id="nG"></g>
-</svg>
+<div id="detail">
+  <div id="detail-row">
+    <div id="detail-info">Click a node ● or transition state ◆ to view its structure.</div>
+    <button id="close-btn">✕</button>
+  </div>
+  <div id="v3d"></div>
+</div>
 <script>
 const NS='http://www.w3.org/2000/svg';
 const NODES=__NODES__;
 const TS=__TS__;
+const ELEMENT=__ELEMENT__;
 const orig={};NODES.forEach(n=>orig[n.id]={x:n.x,y:n.y});
 const P={};NODES.forEach(n=>P[n.id]={x:n.x,y:n.y});
 const svg=document.getElementById('g');
 const eG=document.getElementById('eG'),lG=document.getElementById('lG');
 const tG=document.getElementById('tG'),nG=document.getElementById('nG');
 const tip=document.getElementById('tip');
-let showL=false,drag=null,ds=null;
+const detailInfo=document.getElementById('detail-info');
+const closeBtn=document.getElementById('close-btn');
+const v3dDiv=document.getElementById('v3d');
+let showL=false,drag=null,ds=null,dragMoved=false;
 
-// Build TS elements: one line per connected minimum + a diamond at the centroid
+// ── 3D viewer ──────────────────────────────────────────────────────────────
+function show3d(coords){
+  v3dDiv.style.display='block';
+  v3dDiv.innerHTML='';
+  if(typeof $3Dmol==='undefined'){
+    v3dDiv.innerHTML="<p style='color:#888;padding:12px;font-size:12px'>3Dmol.js could not load — check your internet connection.</p>";
+    return;
+  }
+  const lines=[String(coords.length),'structure'];
+  coords.forEach(function(c){
+    lines.push(ELEMENT+' '+c[0].toFixed(6)+' '+c[1].toFixed(6)+' '+c[2].toFixed(6));
+  });
+  const v=$3Dmol.createViewer(v3dDiv,{backgroundColor:'#0f0f1a'});
+  v.addModel(lines.join('\n'),'xyz');
+  v.setStyle({},{sphere:{radius:0.35,colorscheme:'Jmol'}});
+  v.zoomTo();v.render();
+}
+
+function selectItem(info){
+  closeBtn.style.display='inline';
+  v3dDiv.style.display='none';
+  v3dDiv.innerHTML='';
+  if(info.type==='node'){
+    let h='<b>Node '+info.id+'</b>&emsp;Energy: '+info.energy;
+    if(!info.coords) h+='<br><span style="color:#555">No coordinates available</span>';
+    detailInfo.innerHTML=h;
+    if(info.coords) show3d(info.coords);
+  } else {
+    const pStr=info.pairs.map(function(p){return p[0]+' ↔ '+p[1];}).join(', ');
+    let h='<b>Transition state</b>&emsp;Energy: '+info.e+'<br>Connects: '+pStr+'<br>Source: '+info.source;
+    if(!info.c) h+='<br><span style="color:#555">No coordinates available</span>';
+    detailInfo.innerHTML=h;
+    if(info.c) show3d(info.c);
+  }
+}
+
+closeBtn.addEventListener('click',function(){
+  detailInfo.innerHTML='Click a node ● or transition state ◆ to view its structure.';
+  v3dDiv.style.display='none';v3dDiv.innerHTML='';
+  closeBtn.style.display='none';
+});
+
+// ── TS elements ────────────────────────────────────────────────────────────
 const tsEls=[];
 TS.forEach(ts=>{
   const uMins=new Set();
   ts.pairs.forEach(p=>{uMins.add(p[0]);uMins.add(p[1]);});
   const pStr=ts.pairs.map(p=>p[0]+' ↔ '+p[1]).join(', ');
-  const tipTxt='Transition state\nEnergy: '+ts.e+'\nConnects: '+pStr+'\nSource: '+ts.source;
+  const tipTxt='Transition state\nEnergy: '+ts.e+'\nConnects: '+pStr+'\nSource: '+ts.source+(ts.c?'\nCoordinates available':'');
   const lines=[];
   uMins.forEach(mid=>{
     const ln=document.createElementNS(NS,'line');
@@ -578,13 +727,15 @@ TS.forEach(ts=>{
   tG.appendChild(poly);
   const hitP=document.createElementNS(NS,'polygon');
   hitP.setAttribute('fill','transparent');hitP.setAttribute('stroke','transparent');
+  hitP.style.cursor='pointer';
   hitP.addEventListener('mouseenter',ev=>showTip(ev,tipTxt));
   hitP.addEventListener('mousemove',moveTip);hitP.addEventListener('mouseleave',hideTip);
+  hitP.addEventListener('click',ev=>{ev.stopPropagation();hideTip();selectItem(ts);});
   tG.appendChild(hitP);
   tsEls.push({lines,poly,hitP,tx});
 });
 
-// Build min node elements
+// ── Node elements ──────────────────────────────────────────────────────────
 const nEls={};
 NODES.forEach(n=>{
   const g=document.createElementNS(NS,'g');g.style.cursor='grab';
@@ -596,13 +747,20 @@ NODES.forEach(n=>{
   t.setAttribute('text-anchor','middle');t.setAttribute('dominant-baseline','middle');
   t.setAttribute('pointer-events','none');t.textContent=n.id;
   g.appendChild(c);g.appendChild(t);
-  g.addEventListener('mouseenter',ev=>showTip(ev,'Node '+n.id+'\nEnergy: '+n.energy+(n.hasCoords?'\nCoordinates available':'')));
+  const tipTxt='Node '+n.id+'\nEnergy: '+n.energy+(n.hasCoords?'\nCoordinates available':'');
+  g.addEventListener('mouseenter',ev=>showTip(ev,tipTxt));
   g.addEventListener('mousemove',moveTip);g.addEventListener('mouseleave',hideTip);
   g.addEventListener('mousedown',ev=>startDrag(ev,n.id));
   g.addEventListener('touchstart',ev=>{ev.preventDefault();startDrag(ev.touches[0],n.id);},{passive:false});
+  g.addEventListener('click',ev=>{
+    if(dragMoved)return;
+    ev.stopPropagation();hideTip();
+    selectItem({type:'node',id:n.id,energy:n.energy,coords:n.coords,hasCoords:n.hasCoords});
+  });
   nG.appendChild(g);nEls[n.id]=g;
 });
 
+// ── Layout helpers ─────────────────────────────────────────────────────────
 function tsCenter(ts){
   const uMins=new Set();ts.pairs.forEach(p=>{uMins.add(p[0]);uMins.add(p[1]);});
   let sx=0,sy=0,n=0;
@@ -635,18 +793,21 @@ function redraw(){
 }
 redraw();
 
+// ── Drag ──────────────────────────────────────────────────────────────────
 function svgPt(e){
   const pt=svg.createSVGPoint();pt.x=e.clientX;pt.y=e.clientY;
   return pt.matrixTransform(svg.getScreenCTM().inverse());
 }
 function startDrag(e,id){
   if(e.preventDefault)e.preventDefault();
-  drag=id;const p=svgPt(e);
+  drag=id;dragMoved=false;
+  const p=svgPt(e);
   ds={sx:p.x,sy:p.y,ox:P[id].x,oy:P[id].y};
   nEls[id].style.cursor='grabbing';hideTip();
 }
 function onMove(e){
   if(!drag)return;
+  dragMoved=true;
   const cl=e.touches?e.touches[0]:e;
   const p=svgPt(cl);
   P[drag].x=ds.ox+(p.x-ds.sx);
@@ -674,7 +835,8 @@ function hideTip(){tip.style.display='none';}
 
     return (template
             .replace("__NODES__", json.dumps(nodes_data))
-            .replace("__TS__", json.dumps(ts_data)))
+            .replace("__TS__",    json.dumps(ts_data))
+            .replace("__ELEMENT__", json.dumps(element)))
 
 
 # ── Energy profile line charts ───────────────────────────────────────────────
@@ -891,6 +1053,11 @@ def main():
         up_path = st.file_uploader("path.info", accept_multiple_files=True, key=f"up_path_{folder}")
 
         st.divider()
+        st.caption("Binary coordinate files (Fortran unformatted). Converted to readable text automatically once path.info is loaded.")
+        up_points_min = st.file_uploader("points.min", accept_multiple_files=False, key=f"up_pmin_{folder}")
+        up_points_ts  = st.file_uploader("points.ts",  accept_multiple_files=False, key=f"up_pts_{folder}")
+
+        st.divider()
         st.markdown("**Copy from Linux server (SCP)**")
         if not _PARAMIKO:
             st.warning("Run `pip install paramiko scp` to enable SCP fetching.")
@@ -914,6 +1081,7 @@ def main():
 
                 if clear_clicked:
                     st.session_state.pop(f"ssh_files_{folder}", None)
+                    st.session_state.pop(f"ssh_binary_{folder}", None)
                     st.rerun()
 
                 if fetch_clicked and ssh_host and ssh_user and ssh_dir:
@@ -949,6 +1117,7 @@ def main():
                                 chan.close()
                                 resolved_dir = home + resolved_dir[1:]
                             fetched = {}
+                            binary_fetched = {}
                             file_errors = {}
                             with _SCPClient(t) as scp:
                                 for fname in ["min.data", "ts.data", "path.info"]:
@@ -966,11 +1135,28 @@ def main():
                                     finally:
                                         if tmp and os.path.exists(tmp):
                                             os.unlink(tmp)
+                                for fname in ["points.min", "points.ts"]:
+                                    remote = f"{resolved_dir.rstrip('/')}/{fname}"
+                                    tmp = None
+                                    try:
+                                        fd, tmp = tempfile.mkstemp()
+                                        os.close(fd)
+                                        scp.get(remote, tmp)
+                                        with open(tmp, "rb") as fh:
+                                            raw = fh.read()
+                                        binary_fetched[fname] = (f"{ssh_host}:{fname}", raw)
+                                    except Exception as fe:
+                                        file_errors[fname] = str(fe)
+                                    finally:
+                                        if tmp and os.path.exists(tmp):
+                                            os.unlink(tmp)
                             t.close()
                             st.session_state[f"ssh_files_{folder}"] = fetched
-                            if fetched:
-                                for fname in fetched:
-                                    st.success(f"{fname} has been uploaded successfully.")
+                            if binary_fetched:
+                                st.session_state[f"ssh_binary_{folder}"] = binary_fetched
+                            if fetched or binary_fetched:
+                                for fname in list(fetched) + list(binary_fetched):
+                                    st.success(f"{fname} fetched successfully.")
                             else:
                                 st.error("Nothing fetched — check the directory path below.")
                             for fname, err in file_errors.items():
@@ -978,8 +1164,9 @@ def main():
                         except Exception as exc:
                             st.error(f"Connection failed: {exc}")
 
-                if f"ssh_files_{folder}" in st.session_state:
-                    found = list(st.session_state[f"ssh_files_{folder}"])
+                if f"ssh_files_{folder}" in st.session_state or f"ssh_binary_{folder}" in st.session_state:
+                    found = (list(st.session_state.get(f"ssh_files_{folder}", {}))
+                             + list(st.session_state.get(f"ssh_binary_{folder}", {})))
                     st.caption(f"Loaded from server: {', '.join(found)}")
 
         st.divider()
@@ -1012,7 +1199,7 @@ def main():
   </div>
 </div>
 <div style='font-size:12px;color:#ccc;margin-top:6px'>
-  🟢 Green border = path.info coordinates
+  🟢 Green border = coordinates available (path.info or points.min)
 </div>
 """,
             unsafe_allow_html=True,
@@ -1063,8 +1250,8 @@ You can upload more than one file into each slot. Duplicates are removed automat
   </div>
 </div>
 
-- **Green border** — 3D coordinates available from path.info.
-- No green border — PATHSAMPLE-only node; energy shown but no 3D structure.
+- **Green border** — 3D coordinates available (from path.info or points.min).
+- No green border — energy shown but no 3D structure.
 """,
                 unsafe_allow_html=True,
             )
@@ -1112,9 +1299,11 @@ Switch between slots to load different runs side by side without losing any data
         return
 
     # ── Load and merge ──
-    min_files  = read_files(up_min,  "min.data",  folder)
-    ts_files   = read_files(up_ts,   "ts.data",   folder)
-    path_files = read_files(up_path, "path.info", folder)
+    min_files        = read_files(up_min,  "min.data",  folder)
+    ts_files         = read_files(up_ts,   "ts.data",   folder)
+    path_files       = read_files(up_path, "path.info", folder)
+    points_min_files = read_binary_files(up_points_min, "points.min", folder)
+    points_ts_files  = read_binary_files(up_points_ts,  "points.ts",  folder)
 
     if not min_files and not path_files:
         st.error("Load at least one file — min.data, path.info, or both — to begin.")
@@ -1124,7 +1313,31 @@ Switch between slots to load different runs side by side without losing any data
     ts_e,       ts_parts,  ts_stats  = merge_ts(ts_files, min_files) if ts_files else ([], [], [])
     triplets,   path_stats            = merge_path(path_files) if path_files else ([], [])
 
-    edges, node_coords, min_e, ts_nodes, n_rmsd_merged = build_network(min_e_base, ts_e, triplets)
+    # Atom count from path.info — needed before build_network to parse binary files
+    n_atoms = None
+    if triplets and triplets[0][0].get("c"):
+        n_atoms = len(triplets[0][0]["c"])
+
+    # Build coordinate dicts from binary files (row index → coordinates).
+    # min_coords_base: 1-based index matching min.data row order.
+    # ts_coords_base:  0-based index matching merged ts_e order.
+    min_coords_base = {}
+    if n_atoms and points_min_files:
+        _, raw = points_min_files[0]
+        for i, coords in enumerate(parse_points_binary(raw, n_atoms)):
+            if i < len(min_e_base):
+                min_coords_base[i + 1] = coords
+
+    ts_coords_base = {}
+    if n_atoms and points_ts_files:
+        _, raw = points_ts_files[0]
+        for j, coords in enumerate(parse_points_binary(raw, n_atoms)):
+            if j < len(ts_e):
+                ts_coords_base[j] = coords
+
+    edges, node_coords, min_e, ts_nodes, n_rmsd_merged, node_coord_sources = build_network(
+        min_e_base, ts_e, triplets, min_coords_base, ts_coords_base
+    )
     n_path_only = len(min_e) - len(min_e_base)
 
     edge_tuples = tuple((ed["idA"], ed["idB"]) for ed in edges)
@@ -1142,6 +1355,35 @@ Switch between slots to load different runs side by side without losing any data
             st.caption(f"{n_path_only} node(s) added from path.info with no min.data match")
         if n_rmsd_merged:
             st.caption(f"{n_rmsd_merged} node(s) merged by rotation alignment (RMSD ≤ {_RMSD_TOL:.0e} Å)")
+
+        # Binary coordinate file conversion
+        if points_min_files or points_ts_files:
+            st.divider()
+            st.caption("Binary coordinate files")
+            if n_atoms is None:
+                st.warning("Load path.info to determine atom count before converting.")
+            else:
+                n_pmin_linked = sum(1 for v in node_coord_sources.values() if v == "points.min")
+                if n_pmin_linked:
+                    st.caption(f"{n_pmin_linked} min.data node(s) linked to points.min coordinates")
+                for label, file_list, out_name in [
+                    ("points.min", points_min_files, "points.min.txt"),
+                    ("points.ts",  points_ts_files,  "points.ts.txt"),
+                ]:
+                    for fname, raw in file_list:
+                        text, n_structs = convert_points_binary(raw, n_atoms)
+                        if text is None:
+                            st.warning(f"{label}: byte count not divisible by {n_atoms * 3 * 8} — check atom count.")
+                        else:
+                            st.caption(f"{label}: {n_structs} structure(s) · {n_atoms} atoms each")
+                            st.download_button(
+                                f"Download {out_name}",
+                                data=text,
+                                file_name=out_name,
+                                mime="text/plain",
+                                use_container_width=True,
+                                key=f"btn_dl_{label}_{folder}",
+                            )
 
         st.divider()
         st.caption("Save & share")
@@ -1253,8 +1495,8 @@ Switch between slots to load different runs side by side without losing any data
 
         with graph_col:
             st.components.v1.html(
-                build_draggable_html(min_e, ts_nodes, node_coords, pos),
-                height=720,
+                build_draggable_html(min_e, ts_nodes, node_coords, pos, element),
+                height=800,
                 scrolling=False,
             )
 
@@ -1283,7 +1525,8 @@ Switch between slots to load different runs side by side without losing any data
                 st.markdown(f"### Node {sel}")
                 st.code(f"Energy (14 d.p.):  {e_val:.14f}", language=None)
                 if has_c:
-                    st.success("Coordinates available (path.info)")
+                    coord_src = node_coord_sources.get(sel, "path.info")
+                    st.success(f"Coordinates available ({coord_src})")
                     rows = node_coords[sel]
                     st.components.v1.html(
                         build_3d_viewer_html(rows, element, height=280),
@@ -1408,6 +1651,28 @@ Switch between slots to load different runs side by side without losing any data
                              index=[f"TS {i}" for i in range(1, len(ts_e) + 1)])
             )
 
+            ts_with_pts_coords = [
+                tsn for tsn in ts_nodes
+                if tsn.get("c") and tsn["source"] == "ts.data only"
+            ]
+            if ts_with_pts_coords:
+                st.divider()
+                st.markdown("**3D structures (points.ts)**")
+                for tsn in ts_with_pts_coords:
+                    pairs_str = ", ".join(f"{a} ↔ {b}" for a, b in tsn["pairs"])
+                    label = f"{pairs_str}  |  E = {tsn['e']:.14f}"
+                    with st.expander(label, expanded=False):
+                        st.components.v1.html(
+                            build_3d_viewer_html(tsn["c"], element, height=280),
+                            height=280, scrolling=False,
+                        )
+                        with st.expander("Raw coordinates", expanded=False):
+                            st.dataframe(
+                                pd.DataFrame(tsn["c"], columns=["x", "y", "z"],
+                                             index=range(1, len(tsn["c"]) + 1)),
+                                use_container_width=True,
+                            )
+
     # ─────────────────────────────────────────────────────────────────────────
     # Tab 5 — path.info
     # ─────────────────────────────────────────────────────────────────────────
@@ -1474,13 +1739,15 @@ Switch between slots to load different runs side by side without losing any data
             for ci, (comp_nodes, paths, truncated) in enumerate(ep_components):
                 if truncated:
                     st.caption(f"Component {ci + 1}: showing first 100 of more paths.")
-                path_idx = st.number_input(
-                    f"Chain (1 – {len(paths)})",
-                    min_value=1, max_value=len(paths), value=1, step=1,
-                    key=f"ep_chain_{folder}_{ci}",
-                )
                 st.plotly_chart(
-                    build_single_path_fig(paths[path_idx - 1], comp_nodes, min_e),
+                    build_single_path_fig(
+                        paths[int(st.number_input(
+                            f"Chain (1 – {len(paths)})",
+                            min_value=1, max_value=len(paths), value=1, step=1,
+                            key=f"ep_chain_{folder}_{ci}",
+                        )) - 1],
+                        comp_nodes, min_e,
+                    ),
                     use_container_width=True,
                 )
 
