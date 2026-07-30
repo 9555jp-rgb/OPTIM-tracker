@@ -3,3 +3,4 @@ plotly
 pandas
 paramiko
 scp
+pyknotid

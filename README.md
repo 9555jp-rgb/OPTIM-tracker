@@ -6,20 +6,15 @@ A simple Streamlit app template for you to modify!
 
 ### How to run it on your own machine
 
-Prerequisite: install `uv` if you don't already have it.
+1. Install dependencies
 
-```
-$ curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-1. Sync the dependencies
-
-   ```
-   $ uv sync
+   ```bash
+   python3 -m pip install --upgrade pip
+   python3 -m pip install -r requirements.txt
    ```
 
 2. Run the app
 
-   ```
-   $ uv run streamlit run streamlit_app.py
+   ```bash
+   python3 -m streamlit run streamlit_app.py --server.enableCORS false --server.enableXsrfProtection false
    ```

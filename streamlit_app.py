@@ -15,6 +15,12 @@ try:
 except ImportError:
     _PARAMIKO = False
 
+try:
+    from pyknotid.spacecurves import Knot as _PyknotidKnot
+    _PYKNOTID = True
+except ImportError:
+    _PYKNOTID = False
+
 st.set_page_config(
     page_title="Molecular Energy Landscape",
     layout="wide",
@@ -118,7 +124,7 @@ def parse_path(text):
         if i < len(lines):
             i += 1          # skip symmetry line
         coords = []
-        while i < len(lines) and len(coords) < 100:
+        while i < len(lines):
             parts = lines[i].split()
             if len(parts) == 3:
                 try:
@@ -147,7 +153,7 @@ def merge_min(file_texts):
     principal moments of inertia agree to _MOI_DP decimal places (≈ 5e-5 tolerance).
     Files that omit the moment columns fall back to energy-only deduplication.
     """
-    seen = {}       # key -> (energy, original_line)
+    seen = {}       # key -> (energy, Ix, Iy, Iz, original_line)
     stats = []
     for fname, text in file_texts:
         entries = parse_min(text)   # list of (energy, Ix, Iy, Iz, line)
@@ -158,16 +164,17 @@ def merge_min(file_texts):
             else:
                 key = (e,)
             if key not in seen:
-                seen[key] = (e, line)
+                seen[key] = (e, Ix, Iy, Iz, line)
                 added += 1
             else:
                 dup += 1
         stats.append({"file": fname, "entries": len(entries),
                       "new": added, "duplicates removed": dup})
-    pairs = list(seen.values())
-    energies = [e for e, _ in pairs]
-    lines    = [ln for _, ln in pairs]
-    return energies, lines, stats
+    records  = list(seen.values())
+    energies = [r[0] for r in records]
+    moi_list = [(r[1], r[2], r[3]) if r[1] is not None else None for r in records]
+    lines    = [r[4] for r in records]
+    return energies, moi_list, lines, stats
 
 
 def merge_ts(ts_file_texts, min_file_texts):
@@ -304,7 +311,8 @@ def _kabsch_rmsd(coords_a, coords_b):
     return float(np.sqrt((diff ** 2).sum() / len(A)))
 
 
-def build_network(min_e_base, ts_e, triplets, min_coords_base=None, ts_coords_base=None):
+def build_network(min_e_base, ts_e, triplets, min_coords_base=None, ts_coords_base=None,
+                  min_moi_base=None):
     """Build the edge list, TS node list, and node table from all available data.
 
     Nodes are seeded from min.data (min_e_base). If min_coords_base is supplied
@@ -312,6 +320,10 @@ def build_network(min_e_base, ts_e, triplets, min_coords_base=None, ts_coords_ba
     attached during seeding, enabling RMSD deduplication against path.info structures.
     Each path.info structure is matched first by energy (_MATCH_TOL), then by RMSD
     after optimal rotation (_RMSD_TOL). Unmatched structures become new nodes.
+
+    min_moi_base -- dict mapping 1-based min.data index → (Ix, Iy, Iz) or None.
+    When MoI is available for both the candidate and the incoming structure, an
+    energy match is only accepted if the MoI also agree to _MOI_DP decimal places.
 
     ts_coords_base -- dict mapping 0-based ts_e index → [[x,y,z],...] from points.ts.
     TS deduplication also checks RMSD when coordinates are available.
@@ -322,13 +334,24 @@ def build_network(min_e_base, ts_e, triplets, min_coords_base=None, ts_coords_ba
     all_e = []
     node_coords = {}
     node_coord_sources = {}
+    node_moi = {}   # node_id → (Ix, Iy, Iz) or absent
     rmsd_count = [0]
 
-    def find_match(e):
+    def find_match(e, moi=None):
         if not all_e:
             return None
         best = min(range(len(all_e)), key=lambda j: abs(all_e[j] - e))
-        return best + 1 if abs(all_e[best] - e) <= _MATCH_TOL else None
+        if abs(all_e[best] - e) > _MATCH_TOL:
+            return None
+        nid = best + 1
+        # When both sides carry MoI, require it to agree to _MOI_DP decimal places.
+        if moi is not None and nid in node_moi:
+            nm = node_moi[nid]
+            if (round(moi[0], _MOI_DP) != round(nm[0], _MOI_DP) or
+                    round(moi[1], _MOI_DP) != round(nm[1], _MOI_DP) or
+                    round(moi[2], _MOI_DP) != round(nm[2], _MOI_DP)):
+                return None
+        return nid
 
     def find_rmsd_match(coords):
         for nid, nc in node_coords.items():
@@ -337,7 +360,8 @@ def build_network(min_e_base, ts_e, triplets, min_coords_base=None, ts_coords_ba
         return None
 
     def get_or_create(struct, coord_source="path.info"):
-        nid = find_match(struct["e"])
+        moi = struct.get("moi")
+        nid = find_match(struct["e"], moi)
         if nid is None and struct.get("c"):
             nid = find_rmsd_match(struct["c"])
             if nid is not None:
@@ -345,16 +369,19 @@ def build_network(min_e_base, ts_e, triplets, min_coords_base=None, ts_coords_ba
         if nid is None:
             all_e.append(struct["e"])
             nid = len(all_e)
+        if moi is not None and nid not in node_moi:
+            node_moi[nid] = moi
         if struct.get("c") and nid not in node_coords:
             node_coords[nid] = struct["c"]
             node_coord_sources[nid] = coord_source
         return nid
 
-    # Seed from min.data; RMSD deduplication is active when coordinates are provided,
-    # enabling cross-source merging with path.info and points.min structures.
+    # Seed from min.data; RMSD and MoI deduplication are active when the respective
+    # data are provided, enabling cross-source merging with path.info structures.
     for i, e in enumerate(min_e_base, start=1):
         coords = (min_coords_base or {}).get(i)
-        get_or_create({"e": e, "c": coords},
+        moi    = (min_moi_base    or {}).get(i)
+        get_or_create({"e": e, "c": coords, "moi": moi},
                       coord_source="points.min" if coords else "min.data")
 
     # Collect all raw TS entries from both sources
@@ -550,9 +577,46 @@ def build_3d_viewer_html(coords, element, height=300):
 </body></html>"""
 
 
+# ── Knot classification ───────────────────────────────────────────────────────
+
+def _fmt_knot(name):
+    """Convert pyknotid knot name to Unicode subscript form: '3_1' → '3₁'."""
+    subs = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
+    parts = name.split("_", 1)
+    if len(parts) == 2:
+        return parts[0] + parts[1].translate(subs)
+    return name
+
+
+def classify_knot(coords):
+    """Return the knot type name for an ordered chain of 3D coordinates.
+
+    Assumes sequential connectivity (atom i bonded to atom i+1). The chain is
+    closed by pyknotid before classification. Returns 'unknown' if pyknotid is
+    not installed or classification fails.
+    """
+    if not _PYKNOTID:
+        return "unknown"
+    try:
+        k = _PyknotidKnot(np.array(coords, dtype=float), verbose=False)
+        ids = k.identify()
+        return ids[0].name if ids else "unknown"
+    except Exception:
+        return "unknown"
+
+
+@st.cache_data(show_spinner="Classifying knot types…")
+def classify_all_knots(coords_tuple):
+    """Classify every node with coordinates. coords_tuple must be hashable:
+    tuple of (node_id, tuple-of-tuples) sorted by node_id."""
+    return {nid: classify_knot([list(row) for row in rows])
+            for nid, rows in coords_tuple}
+
+
 # ── Draggable SVG diagram ─────────────────────────────────────────────────────
 
-def build_draggable_html(min_e, ts_nodes, node_coords, pos, element="Au"):
+def build_draggable_html(min_e, ts_nodes, node_coords, pos, element="Au",
+                         knot_types=None, knot_flags=None):
     """Return a self-contained HTML page: SVG diagram with drag-and-drop nodes
     and an inline 3D viewer that opens when a node or transition state is clicked.
 
@@ -565,11 +629,15 @@ def build_draggable_html(min_e, ts_nodes, node_coords, pos, element="Au"):
     te_lo = min(ts_e_all, default=0.0)
     te_hi = max(ts_e_all, default=0.0)
 
+    _knot_types = knot_types or {}
+    _knot_flags = knot_flags or set()
+
     nodes_data = []
     for idx, e in enumerate(min_e, start=1):
         if idx not in pos:
             continue
         x, y = pos[idx]
+        kt = _knot_types.get(idx)
         nodes_data.append({
             "id": idx,
             "x": round(x, 2),
@@ -579,6 +647,8 @@ def build_draggable_html(min_e, ts_nodes, node_coords, pos, element="Au"):
             "energy": f"{e:.14f}",
             "hasCoords": idx in node_coords,
             "coords": node_coords.get(idx),   # [[x,y,z],...] or null
+            "knot": _fmt_knot(kt) if kt else None,
+            "flagged": idx in _knot_flags,
         })
 
     ts_data = []
@@ -624,6 +694,7 @@ svg{display:block;width:100%;height:480px}
 <div id="svgwrap">
   <div id="bar">
     <button id="rst">RESET</button>
+    <button id="zmOut" title="Zoom out">−</button><button id="zmIn" title="Zoom in">+</button>
     <label><input type="checkbox" id="lbl">&nbsp;TS labels</label>
   </div>
   <div id="tip"></div>
@@ -648,11 +719,24 @@ const P={};NODES.forEach(n=>P[n.id]={x:n.x,y:n.y});
 const svg=document.getElementById('g');
 const eG=document.getElementById('eG'),lG=document.getElementById('lG');
 const tG=document.getElementById('tG'),nG=document.getElementById('nG');
+const bgR=document.createElementNS(NS,'rect');
+bgR.setAttribute('x','-50000');bgR.setAttribute('y','-50000');
+bgR.setAttribute('width','100000');bgR.setAttribute('height','100000');
+bgR.setAttribute('fill','transparent');bgR.style.cursor='grab';
+svg.insertBefore(bgR,eG);
+bgR.addEventListener('mousedown',function(e){
+  if(drag)return;e.preventDefault();
+  panDrag={sx:e.clientX,sy:e.clientY,ox:panX,oy:panY};bgR.style.cursor='grabbing';
+});
 const tip=document.getElementById('tip');
 const detailInfo=document.getElementById('detail-info');
 const closeBtn=document.getElementById('close-btn');
 const v3dDiv=document.getElementById('v3d');
 let showL=false,drag=null,ds=null,dragMoved=false;
+let zoom=1,panX=0,panY=0,panDrag=null;
+function updateVB(){svg.setAttribute('viewBox',panX+' '+panY+' '+(940/zoom)+' '+(940/zoom));}
+function getScale(){const r=svg.getBoundingClientRect(),w=940/zoom;return Math.min(r.width/w,r.height/w);}
+function zoomTo(f){const w=940/zoom,cx=panX+w/2,cy=panY+w/2;zoom=Math.max(0.2,Math.min(20,zoom*f));panX=cx-(940/zoom)/2;panY=cy-(940/zoom)/2;updateVB();}
 
 // ── 3D viewer ──────────────────────────────────────────────────────────────
 function show3d(coords){
@@ -747,10 +831,17 @@ NODES.forEach(n=>{
   t.setAttribute('text-anchor','middle');t.setAttribute('dominant-baseline','middle');
   t.setAttribute('pointer-events','none');t.textContent=n.id;
   g.appendChild(c);g.appendChild(t);
-  const tipTxt='Node '+n.id+'\nEnergy: '+n.energy+(n.hasCoords?'\nCoordinates available':'');
+  const tipTxt='Node '+n.id+'\nEnergy: '+n.energy+(n.hasCoords?'\nCoordinates available':'')+(n.knot?'\nKnot: '+n.knot:'')+(n.flagged?'\n⚠ Different knot from node 1':'');
+  if(n.flagged){
+    const ring=document.createElementNS(NS,'circle');
+    ring.setAttribute('r','21');ring.setAttribute('fill','none');
+    ring.setAttribute('stroke','#ff8800');ring.setAttribute('stroke-width','2');
+    ring.setAttribute('stroke-dasharray','4 3');ring.setAttribute('pointer-events','none');
+    g.appendChild(ring);
+  }
   g.addEventListener('mouseenter',ev=>showTip(ev,tipTxt));
   g.addEventListener('mousemove',moveTip);g.addEventListener('mouseleave',hideTip);
-  g.addEventListener('mousedown',ev=>startDrag(ev,n.id));
+  g.addEventListener('mousedown',ev=>{ev.stopPropagation();startDrag(ev,n.id);});
   g.addEventListener('touchstart',ev=>{ev.preventDefault();startDrag(ev.touches[0],n.id);},{passive:false});
   g.addEventListener('click',ev=>{
     if(dragMoved)return;
@@ -806,15 +897,23 @@ function startDrag(e,id){
   nEls[id].style.cursor='grabbing';hideTip();
 }
 function onMove(e){
-  if(!drag)return;
-  dragMoved=true;
-  const cl=e.touches?e.touches[0]:e;
-  const p=svgPt(cl);
-  P[drag].x=ds.ox+(p.x-ds.sx);
-  P[drag].y=ds.oy+(p.y-ds.sy);
-  redraw();
+  if(drag){
+    dragMoved=true;
+    const cl=e.touches?e.touches[0]:e;
+    const p=svgPt(cl);
+    P[drag].x=ds.ox+(p.x-ds.sx);P[drag].y=ds.oy+(p.y-ds.sy);
+    redraw();
+  }else if(panDrag){
+    const sc=getScale();
+    panX=panDrag.ox-(e.clientX-panDrag.sx)/sc;
+    panY=panDrag.oy-(e.clientY-panDrag.sy)/sc;
+    updateVB();
+  }
 }
-function onUp(){if(drag){nEls[drag].style.cursor='grab';drag=null;}}
+function onUp(){
+  if(drag){nEls[drag].style.cursor='grab';drag=null;}
+  if(panDrag){panDrag=null;bgR.style.cursor='grab';}
+}
 svg.addEventListener('mousemove',onMove);
 svg.addEventListener('mouseup',onUp);
 svg.addEventListener('mouseleave',onUp);
@@ -822,9 +921,19 @@ svg.addEventListener('touchmove',e=>{e.preventDefault();onMove(e);},{passive:fal
 svg.addEventListener('touchend',onUp);
 
 document.getElementById('rst').addEventListener('click',()=>{
-  NODES.forEach(n=>{P[n.id]={x:orig[n.id].x,y:orig[n.id].y};});redraw();
+  NODES.forEach(n=>{P[n.id]={x:orig[n.id].x,y:orig[n.id].y};});
+  zoom=1;panX=0;panY=0;updateVB();redraw();
 });
 document.getElementById('lbl').addEventListener('change',e=>{showL=e.target.checked;redraw();});
+document.getElementById('zmIn').addEventListener('click',()=>zoomTo(1.25));
+document.getElementById('zmOut').addEventListener('click',()=>zoomTo(0.8));
+svg.addEventListener('wheel',function(e){
+  e.preventDefault();
+  const f=e.deltaY<0?1.25:0.8,pt=svgPt(e);
+  const nz=Math.max(0.2,Math.min(20,zoom*f)),af=nz/zoom;
+  panX=pt.x-(pt.x-panX)/af;panY=pt.y-(pt.y-panY)/af;
+  zoom=nz;updateVB();
+},{passive:false});
 
 function showTip(e,txt){
   tip.innerHTML=txt.replace(/\n/g,'<br>');tip.style.display='block';moveTip(e);
@@ -1302,14 +1411,19 @@ Switch between slots to load different runs side by side without losing any data
     min_files        = read_files(up_min,  "min.data",  folder)
     ts_files         = read_files(up_ts,   "ts.data",   folder)
     path_files       = read_files(up_path, "path.info", folder)
-    points_min_files = read_binary_files(up_points_min, "points.min", folder)
-    points_ts_files  = read_binary_files(up_points_ts,  "points.ts",  folder)
+    points_min_files = read_binary_files(
+        [up_points_min] if up_points_min is not None else [], "points.min", folder
+    )
+    points_ts_files = read_binary_files(
+        [up_points_ts] if up_points_ts is not None else [], "points.ts", folder
+    )
 
     if not min_files and not path_files:
         st.error("Load at least one file — min.data, path.info, or both — to begin.")
         return
 
-    min_e_base, min_lines, min_stats = merge_min(min_files) if min_files else ([], [], [])
+    min_e_base, min_moi_list, min_lines, min_stats = merge_min(min_files) if min_files else ([], [], [], [])
+    min_moi_base = {i + 1: m for i, m in enumerate(min_moi_list) if m is not None}
     ts_e,       ts_parts,  ts_stats  = merge_ts(ts_files, min_files) if ts_files else ([], [], [])
     triplets,   path_stats            = merge_path(path_files) if path_files else ([], [])
 
@@ -1336,9 +1450,25 @@ Switch between slots to load different runs side by side without losing any data
                 ts_coords_base[j] = coords
 
     edges, node_coords, min_e, ts_nodes, n_rmsd_merged, node_coord_sources = build_network(
-        min_e_base, ts_e, triplets, min_coords_base, ts_coords_base
+        min_e_base, ts_e, triplets, min_coords_base, ts_coords_base, min_moi_base
     )
     n_path_only = len(min_e) - len(min_e_base)
+
+    # ── Knot classification ──
+    knot_types = {}
+    knot_flags = set()
+    ref_knot   = None
+    ref_nid    = None
+    if node_coords and _PYKNOTID:
+        coords_tuple = tuple(
+            (nid, tuple(tuple(row) for row in c))
+            for nid, c in sorted(node_coords.items())
+        )
+        knot_types = classify_all_knots(coords_tuple)
+        ref_nid  = min(node_coords)
+        ref_knot = knot_types.get(ref_nid, "unknown")
+        knot_flags = {nid for nid, kt in knot_types.items()
+                      if kt != ref_knot and kt != "unknown"}
 
     edge_tuples = tuple((ed["idA"], ed["idB"]) for ed in edges)
     spine = find_longest_chain(edge_tuples, len(min_e))
@@ -1355,6 +1485,14 @@ Switch between slots to load different runs side by side without losing any data
             st.caption(f"{n_path_only} node(s) added from path.info with no min.data match")
         if n_rmsd_merged:
             st.caption(f"{n_rmsd_merged} node(s) merged by rotation alignment (RMSD ≤ {_RMSD_TOL:.0e} Å)")
+        if knot_flags:
+            flagged_knots = sorted({knot_types[n] for n in knot_flags})
+            st.caption(
+                f"{len(knot_flags)} node(s) have a different knot type from node {ref_nid} "
+                f"({_fmt_knot(ref_knot)}): {', '.join(_fmt_knot(k) for k in flagged_knots)}"
+            )
+        elif ref_knot and ref_knot != "unknown":
+            st.caption(f"All classified nodes match node {ref_nid} knot type: {_fmt_knot(ref_knot)}")
 
         # Binary coordinate file conversion
         if points_min_files or points_ts_files:
@@ -1429,15 +1567,17 @@ Switch between slots to load different runs side by side without losing any data
             st.caption(
                 "Save the session file first, then attach it to your email."
             )
-            subj = urllib.parse.quote("Molecular Energy Landscape Session")
-            body = urllib.parse.quote(
+            body_txt = (
                 f"Hi,\n\nI am sharing a molecular energy landscape session "
                 f"(subfolder {folder}, {len(min_e)} minima, "
                 f"{len(edges)} transition states).\n\n"
                 f"Please find the session file (session.json) attached.\n\nRegards"
             )
+            subj     = urllib.parse.quote("Molecular Energy Landscape Session")
+            body     = urllib.parse.quote(body_txt)
+            body_ol  = urllib.parse.quote(body_txt.replace("\n", "\r\n"))
             gmail   = f"https://mail.google.com/mail/?view=cm&fs=1&su={subj}&body={body}"
-            outlook = f"https://outlook.live.com/mail/0/deeplink/compose?subject={subj}&body={body}"
+            outlook = f"https://outlook.live.com/mail/deeplink/compose?subject={subj}&body={body_ol}"
             mailto  = f"mailto:?subject={subj}&body={body}"
             st.markdown(
                 f"""
@@ -1495,7 +1635,8 @@ Switch between slots to load different runs side by side without losing any data
 
         with graph_col:
             st.components.v1.html(
-                build_draggable_html(min_e, ts_nodes, node_coords, pos, element),
+                build_draggable_html(min_e, ts_nodes, node_coords, pos, element,
+                                     knot_types, knot_flags),
                 height=800,
                 scrolling=False,
             )
@@ -1527,6 +1668,12 @@ Switch between slots to load different runs side by side without losing any data
                 if has_c:
                     coord_src = node_coord_sources.get(sel, "path.info")
                     st.success(f"Coordinates available ({coord_src})")
+                    if sel in knot_types:
+                        kt_fmt = _fmt_knot(knot_types[sel])
+                        if sel in knot_flags:
+                            st.warning(f"Knot type: {kt_fmt}  ⚠ differs from node {ref_nid} ({_fmt_knot(ref_knot)})")
+                        else:
+                            st.info(f"Knot type: {kt_fmt}")
                     rows = node_coords[sel]
                     st.components.v1.html(
                         build_3d_viewer_html(rows, element, height=280),
