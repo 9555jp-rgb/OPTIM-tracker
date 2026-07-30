@@ -1162,9 +1162,16 @@ def main():
         up_path = st.file_uploader("path.info", accept_multiple_files=True, key=f"up_path_{folder}")
 
         st.divider()
-        st.caption("Binary coordinate files (Fortran unformatted). Converted to readable text automatically once path.info is loaded.")
+        st.caption("Binary coordinate files (Fortran unformatted).")
         up_points_min = st.file_uploader("points.min", accept_multiple_files=False, key=f"up_pmin_{folder}")
         up_points_ts  = st.file_uploader("points.ts",  accept_multiple_files=False, key=f"up_pts_{folder}")
+        n_atoms_input = st.number_input(
+            "Number of atoms (required to read binary files without path.info)",
+            min_value=1, value=None, step=1,
+            key=f"n_atoms_{folder}",
+            help="Set this to the atom count of your molecule. "
+                 "Detected automatically from path.info when that file is loaded.",
+        )
 
         st.divider()
         st.markdown("**Copy from Linux server (SCP)**")
@@ -1427,10 +1434,12 @@ Switch between slots to load different runs side by side without losing any data
     ts_e,       ts_parts,  ts_stats  = merge_ts(ts_files, min_files) if ts_files else ([], [], [])
     triplets,   path_stats            = merge_path(path_files) if path_files else ([], [])
 
-    # Atom count from path.info — needed before build_network to parse binary files
+    # Atom count: prefer path.info, fall back to the sidebar number input.
     n_atoms = None
     if triplets and triplets[0][0].get("c"):
         n_atoms = len(triplets[0][0]["c"])
+    if n_atoms is None and n_atoms_input:
+        n_atoms = int(n_atoms_input)
 
     # Build coordinate dicts from binary files (row index → coordinates).
     # min_coords_base: 1-based index matching min.data row order.
