@@ -1166,11 +1166,11 @@ def main():
         up_points_min = st.file_uploader("points.min", accept_multiple_files=False, key=f"up_pmin_{folder}")
         up_points_ts  = st.file_uploader("points.ts",  accept_multiple_files=False, key=f"up_pts_{folder}")
         n_atoms_input = st.number_input(
-            "Number of atoms (required to read binary files without path.info)",
-            min_value=1, value=None, step=1,
+            "Number of atoms per structure (leave 0 if path.info is loaded)",
+            min_value=0, value=0, step=1,
             key=f"n_atoms_{folder}",
-            help="Set this to the atom count of your molecule. "
-                 "Detected automatically from path.info when that file is loaded.",
+            help="Set this to the atom count of your molecule when loading binary files "
+                 "without path.info. Detected automatically from path.info when loaded.",
         )
 
         st.divider()
@@ -1438,23 +1438,29 @@ Switch between slots to load different runs side by side without losing any data
     n_atoms = None
     if triplets and triplets[0][0].get("c"):
         n_atoms = len(triplets[0][0]["c"])
-    if n_atoms is None and n_atoms_input:
+    if n_atoms is None and n_atoms_input and int(n_atoms_input) > 0:
         n_atoms = int(n_atoms_input)
 
     # Build coordinate dicts from binary files (row index → coordinates).
     # min_coords_base: 1-based index matching min.data row order.
     # ts_coords_base:  0-based index matching merged ts_e order.
     min_coords_base = {}
+    n_pmin_parsed   = 0
     if n_atoms and points_min_files:
         _, raw = points_min_files[0]
-        for i, coords in enumerate(parse_points_binary(raw, n_atoms)):
+        parsed_pmin = parse_points_binary(raw, n_atoms)
+        n_pmin_parsed = len(parsed_pmin)
+        for i, coords in enumerate(parsed_pmin):
             if i < len(min_e_base):
                 min_coords_base[i + 1] = coords
 
     ts_coords_base = {}
+    n_pts_parsed   = 0
     if n_atoms and points_ts_files:
         _, raw = points_ts_files[0]
-        for j, coords in enumerate(parse_points_binary(raw, n_atoms)):
+        parsed_pts = parse_points_binary(raw, n_atoms)
+        n_pts_parsed = len(parsed_pts)
+        for j, coords in enumerate(parsed_pts):
             if j < len(ts_e):
                 ts_coords_base[j] = coords
 
@@ -1508,28 +1514,59 @@ Switch between slots to load different runs side by side without losing any data
             st.divider()
             st.caption("Binary coordinate files")
             if n_atoms is None:
-                st.warning("Load path.info to determine atom count before converting.")
+                st.warning(
+                    "Atom count unknown. Load path.info or set **Number of atoms** "
+                    "in the sidebar to read binary coordinates."
+                )
             else:
-                n_pmin_linked = sum(1 for v in node_coord_sources.values() if v == "points.min")
-                if n_pmin_linked:
-                    st.caption(f"{n_pmin_linked} min.data node(s) linked to points.min coordinates")
-                for label, file_list, out_name in [
-                    ("points.min", points_min_files, "points.min.txt"),
-                    ("points.ts",  points_ts_files,  "points.ts.txt"),
-                ]:
-                    for fname, raw in file_list:
-                        text, n_structs = convert_points_binary(raw, n_atoms)
-                        if text is None:
-                            st.warning(f"{label}: byte count not divisible by {n_atoms * 3 * 8} — check atom count.")
-                        else:
-                            st.caption(f"{label}: {n_structs} structure(s) · {n_atoms} atoms each")
+                st.caption(f"Atom count in use: **{n_atoms}**")
+                # points.min status
+                if points_min_files:
+                    fname_pmin = points_min_files[0][0]
+                    n_bytes_pmin = len(points_min_files[0][1])
+                    if n_pmin_parsed == 0:
+                        st.error(
+                            f"points.min ({fname_pmin}): could not parse — "
+                            f"{n_bytes_pmin} bytes is not divisible by "
+                            f"{n_atoms} atoms × 3 × 8 bytes = {n_atoms * 3 * 8} bytes/structure. "
+                            f"Check the atom count."
+                        )
+                    else:
+                        n_pmin_linked = sum(1 for v in node_coord_sources.values() if v == "points.min")
+                        st.caption(
+                            f"points.min: {n_pmin_parsed} structure(s) parsed, "
+                            f"{n_pmin_linked} linked to min.data nodes"
+                        )
+                        _, raw = points_min_files[0]
+                        text, _ = convert_points_binary(raw, n_atoms)
+                        if text:
                             st.download_button(
-                                f"Download {out_name}",
-                                data=text,
-                                file_name=out_name,
-                                mime="text/plain",
-                                use_container_width=True,
-                                key=f"btn_dl_{label}_{folder}",
+                                "Download points.min.txt",
+                                data=text, file_name="points.min.txt",
+                                mime="text/plain", use_container_width=True,
+                                key=f"btn_dl_pmin_{folder}",
+                            )
+                # points.ts status
+                if points_ts_files:
+                    fname_pts = points_ts_files[0][0]
+                    n_bytes_pts = len(points_ts_files[0][1])
+                    if n_pts_parsed == 0:
+                        st.error(
+                            f"points.ts ({fname_pts}): could not parse — "
+                            f"{n_bytes_pts} bytes is not divisible by "
+                            f"{n_atoms} atoms × 3 × 8 bytes = {n_atoms * 3 * 8} bytes/structure. "
+                            f"Check the atom count."
+                        )
+                    else:
+                        st.caption(f"points.ts: {n_pts_parsed} structure(s) parsed")
+                        _, raw = points_ts_files[0]
+                        text, _ = convert_points_binary(raw, n_atoms)
+                        if text:
+                            st.download_button(
+                                "Download points.ts.txt",
+                                data=text, file_name="points.ts.txt",
+                                mime="text/plain", use_container_width=True,
+                                key=f"btn_dl_pts_{folder}",
                             )
 
         st.divider()
