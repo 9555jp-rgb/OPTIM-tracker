@@ -1327,38 +1327,39 @@ def main():
                             fetched = {}
                             binary_fetched = {}
                             file_errors = {}
-                            with _SCPClient(t) as scp:
-                                for fname in ["min.data", "ts.data", "path.info",
-                                              "extractmin", "extractts"]:
-                                    remote = f"{resolved_dir.rstrip('/')}/{fname}"
-                                    tmp = None
-                                    try:
-                                        fd, tmp = tempfile.mkstemp()
-                                        os.close(fd)
+                            for fname in ["min.data", "ts.data", "path.info",
+                                          "extractmin", "extractts"]:
+                                remote = f"{resolved_dir.rstrip('/')}/{fname}"
+                                tmp = None
+                                try:
+                                    fd, tmp = tempfile.mkstemp()
+                                    os.close(fd)
+                                    with _SCPClient(t) as scp:
                                         scp.get(remote, tmp)
-                                        with open(tmp, encoding="utf-8") as fh:
-                                            text = fh.read()
-                                        fetched[fname] = (f"{ssh_host}:{fname}", text)
-                                    except Exception as fe:
-                                        file_errors[fname] = str(fe)
-                                    finally:
-                                        if tmp and os.path.exists(tmp):
-                                            os.unlink(tmp)
-                                for fname in ["points.min", "points.ts"]:
-                                    remote = f"{resolved_dir.rstrip('/')}/{fname}"
-                                    tmp = None
-                                    try:
-                                        fd, tmp = tempfile.mkstemp()
-                                        os.close(fd)
+                                    with open(tmp, encoding="utf-8") as fh:
+                                        text = fh.read()
+                                    fetched[fname] = (f"{ssh_host}:{fname}", text)
+                                except Exception as fe:
+                                    file_errors[fname] = str(fe)
+                                finally:
+                                    if tmp and os.path.exists(tmp):
+                                        os.unlink(tmp)
+                            for fname in ["points.min", "points.ts"]:
+                                remote = f"{resolved_dir.rstrip('/')}/{fname}"
+                                tmp = None
+                                try:
+                                    fd, tmp = tempfile.mkstemp()
+                                    os.close(fd)
+                                    with _SCPClient(t) as scp:
                                         scp.get(remote, tmp)
-                                        with open(tmp, "rb") as fh:
-                                            raw = fh.read()
-                                        binary_fetched[fname] = (f"{ssh_host}:{fname}", raw)
-                                    except Exception as fe:
-                                        file_errors[fname] = str(fe)
-                                    finally:
-                                        if tmp and os.path.exists(tmp):
-                                            os.unlink(tmp)
+                                    with open(tmp, "rb") as fh:
+                                        raw = fh.read()
+                                    binary_fetched[fname] = (f"{ssh_host}:{fname}", raw)
+                                except Exception as fe:
+                                    file_errors[fname] = str(fe)
+                                finally:
+                                    if tmp and os.path.exists(tmp):
+                                        os.unlink(tmp)
                             t.close()
                             st.session_state[f"ssh_files_{folder}"] = fetched
                             if binary_fetched:
