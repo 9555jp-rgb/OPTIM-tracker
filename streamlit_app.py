@@ -29,9 +29,9 @@ st.set_page_config(
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULTS = {
-    "min.data":  os.path.join(_BASE, "Results", "min.data"),
-    "ts.data":   os.path.join(_BASE, "Results", "ts.data"),
-    "path.info": os.path.join(_BASE, "Results", "path.info"),
+    "min.data":  os.path.join(_BASE, "Results", "PATHSAMPLE", "min.data"),
+    "ts.data":   os.path.join(_BASE, "Results", "PATHSAMPLE", "ts.data"),
+    "path.info": os.path.join(_BASE, "Results", "OPTIM",      "path.info"),
 }
 
 
@@ -265,6 +265,32 @@ def convert_points_binary(raw_bytes, n_atoms):
     return "\n".join(lines), n_structs
 
 
+def parse_extract_text(text, n_atoms):
+    """Parse a plain-text coordinate file (extractmin or extractts).
+
+    Reads lines of 3 floats (or element + 3 floats) and groups them into
+    structures of n_atoms atoms each. Returns a list of [[x, y, z], ...] blocks.
+    """
+    all_coords = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            try:
+                all_coords.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                continue
+            except ValueError:
+                pass
+            if len(parts) >= 4:
+                try:
+                    all_coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                except ValueError:
+                    pass
+    return [
+        all_coords[i: i + n_atoms]
+        for i in range(0, len(all_coords) - n_atoms + 1, n_atoms)
+    ]
+
+
 def merge_path(file_texts):
     """Combine path.info from multiple files; dedup triplets by TS energy."""
     seen = set()
@@ -476,24 +502,20 @@ def find_longest_chain(edge_tuples, n_nodes):
 
 
 @st.cache_data(show_spinner=False)
-def positions(n_nodes, spine):
-    """Spine nodes centred at x=470, evenly spaced top-to-bottom.
-    Remaining nodes arranged in ring pairs around the centre.
+def positions_for_nodes(node_ids_tuple, spine):
+    """Place nodes for an explicit set of node IDs.
+    Spine nodes go top-to-bottom at x=470; remaining nodes in ring pairs.
+    node_ids_tuple must be a sorted tuple (hashable for caching).
     """
     cx, cy, r = 470, 470, 310
     pos = {}
-
-    # Place spine along the vertical centre
     k = len(spine)
     y_top, y_bot = 70, 870
     for i, node_id in enumerate(spine):
         y = y_top if k == 1 else y_top + i * (y_bot - y_top) / (k - 1)
         pos[node_id] = (cx, round(y, 2))
-
-    # Remaining nodes in ring pairs
-    ring_ids = [i for i in range(1, n_nodes + 1) if i not in pos]
-    n_pairs  = math.ceil(len(ring_ids) / 2)
-
+    ring_ids = [nid for nid in node_ids_tuple if nid not in pos]
+    n_pairs = math.ceil(len(ring_ids) / 2)
     for p_idx in range(n_pairs):
         ang  = math.radians(p_idx * (360 / max(n_pairs, 1)))
         pcx  = cx + r * math.cos(ang)
@@ -505,7 +527,70 @@ def positions(n_nodes, spine):
         if 2 * p_idx + 1 < len(ring_ids):
             b      = ring_ids[2 * p_idx + 1]
             pos[b] = (round(pcx + ox, 2), round(pcy + oy, 2))
+    return pos
 
+
+def find_connected_components(edges, n_nodes):
+    """Find connected components of the graph.
+
+    Returns (components, isolated) where components is a list of frozensets
+    of node IDs (each with ≥ 2 nodes) and isolated is a list of node IDs
+    with no edges.
+    """
+    adj = {}
+    for ed in edges:
+        a, b = ed["idA"], ed["idB"]
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    visited = set()
+    components = []
+    isolated = []
+    for start in range(1, n_nodes + 1):
+        if start in visited:
+            continue
+        visited.add(start)
+        if start not in adj:
+            isolated.append(start)
+            continue
+        comp = {start}
+        queue = list(adj[start] - visited)
+        while queue:
+            nxt = queue.pop()
+            if nxt in comp:
+                continue
+            comp.add(nxt)
+            visited.add(nxt)
+            queue.extend(nb for nb in adj.get(nxt, set()) if nb not in comp)
+        components.append(frozenset(comp))
+    return components, isolated
+
+
+def positions_for_small_grid(small_comps):
+    """Lay out multiple 2-node components in a grid across the SVG space.
+
+    small_comps: list of frozensets of node IDs (each with 1 or 2 nodes).
+    Returns a pos dict mapping node_id → (x, y).
+    """
+    pos = {}
+    n = len(small_comps)
+    if n == 0:
+        return pos
+    cols = min(4, n)
+    rows = math.ceil(n / cols)
+    cell_w = 880.0 / cols
+    cell_h = 800.0 / rows
+    for i, comp in enumerate(small_comps):
+        row = i // cols
+        col = i % cols
+        cx = 30 + cell_w * col + cell_w / 2
+        cy = 70 + cell_h * row + cell_h / 2
+        sorted_comp = sorted(comp)
+        if len(sorted_comp) == 1:
+            pos[sorted_comp[0]] = (round(cx, 2), round(cy, 2))
+        else:
+            half = min(cell_h * 0.28, 90)
+            pos[sorted_comp[0]] = (round(cx, 2), round(cy - half, 2))
+            pos[sorted_comp[1]] = (round(cx, 2), round(cy + half, 2))
     return pos
 
 
@@ -1174,6 +1259,13 @@ def main():
         )
 
         st.divider()
+        st.caption("Plain text coordinate files (from PATHSAMPLE EXTRACT).")
+        up_extractmin = st.file_uploader("extractmin", accept_multiple_files=False,
+                                         key=f"up_exmin_{folder}")
+        up_extractts  = st.file_uploader("extractts",  accept_multiple_files=False,
+                                         key=f"up_exts_{folder}")
+
+        st.divider()
         st.markdown("**Copy from Linux server (SCP)**")
         if not _PARAMIKO:
             st.warning("Run `pip install paramiko scp` to enable SCP fetching.")
@@ -1236,7 +1328,8 @@ def main():
                             binary_fetched = {}
                             file_errors = {}
                             with _SCPClient(t) as scp:
-                                for fname in ["min.data", "ts.data", "path.info"]:
+                                for fname in ["min.data", "ts.data", "path.info",
+                                              "extractmin", "extractts"]:
                                     remote = f"{resolved_dir.rstrip('/')}/{fname}"
                                     tmp = None
                                     try:
@@ -1337,6 +1430,8 @@ def main():
 The file is too large to copy and paste by hand without risk of truncation.
 
 You can upload more than one file into each slot. Duplicates are removed automatically.
+
+**extractmin** and **extractts** are plain-text coordinate files produced by PATHSAMPLE's EXTRACT keyword. They give atomic coordinates for each minimum and transition state in the same order as min.data and ts.data. These files may be larger than the .data files — extra structures beyond the current min.data or ts.data are listed separately in the spider web tab. Set the atom count in the sidebar before loading them. See the Wales Group PATHSAMPLE documentation for details on the EXTRACT keyword and output format.
 """
             )
             st.markdown("### The spider web diagram")
@@ -1424,6 +1519,12 @@ Switch between slots to load different runs side by side without losing any data
     points_ts_files = read_binary_files(
         [up_points_ts] if up_points_ts is not None else [], "points.ts", folder
     )
+    extractmin_files = read_files(
+        [up_extractmin] if up_extractmin is not None else [], "extractmin", folder
+    )
+    extractts_files = read_files(
+        [up_extractts] if up_extractts is not None else [], "extractts", folder
+    )
 
     if not min_files and not path_files:
         st.error("Load at least one file — min.data, path.info, or both — to begin.")
@@ -1464,6 +1565,31 @@ Switch between slots to load different runs side by side without losing any data
             if j < len(ts_e):
                 ts_coords_base[j] = coords
 
+    # Plain-text extract files. Always parsed so per-cluster tables work.
+    # Coordinates are only copied into min_coords_base / ts_coords_base when
+    # binary files have not already populated them.
+    parsed_exmin = []
+    n_exmin_parsed = 0
+    if n_atoms and extractmin_files:
+        _, exmin_text = extractmin_files[0]
+        parsed_exmin = parse_extract_text(exmin_text, n_atoms)
+        n_exmin_parsed = len(parsed_exmin)
+        if not min_coords_base:
+            for i, coords in enumerate(parsed_exmin):
+                if i < len(min_e_base):
+                    min_coords_base[i + 1] = coords
+
+    parsed_exts = []
+    n_exts_parsed = 0
+    if n_atoms and extractts_files:
+        _, exts_text = extractts_files[0]
+        parsed_exts = parse_extract_text(exts_text, n_atoms)
+        n_exts_parsed = len(parsed_exts)
+        if not ts_coords_base:
+            for j, coords in enumerate(parsed_exts):
+                if j < len(ts_e):
+                    ts_coords_base[j] = coords
+
     edges, node_coords, min_e, ts_nodes, n_rmsd_merged, node_coord_sources = build_network(
         min_e_base, ts_e, triplets, min_coords_base, ts_coords_base, min_moi_base
     )
@@ -1485,9 +1611,23 @@ Switch between slots to load different runs side by side without losing any data
         knot_flags = {nid for nid, kt in knot_types.items()
                       if kt != ref_knot and kt != "unknown"}
 
-    edge_tuples = tuple((ed["idA"], ed["idB"]) for ed in edges)
-    spine = find_longest_chain(edge_tuples, len(min_e))
-    pos = positions(len(min_e), spine)
+    components, isolated_nodes = find_connected_components(edges, len(min_e))
+    large_comps = [c for c in components if len(c) > 2]
+    small_comps  = [c for c in components if len(c) <= 2]
+
+    comp_layouts = []  # (comp_nodes, spine, pos, ts_nodes_for_comp)
+    for comp_nodes in large_comps:
+        ce     = tuple((ed["idA"], ed["idB"]) for ed in edges
+                       if ed["idA"] in comp_nodes and ed["idB"] in comp_nodes)
+        cspine = find_longest_chain(ce, len(comp_nodes))
+        cpos   = positions_for_nodes(tuple(sorted(comp_nodes)), cspine)
+        ctsn   = [tsn for tsn in ts_nodes
+                  if any(a in comp_nodes and b in comp_nodes for a, b in tsn["pairs"])]
+        comp_layouts.append((comp_nodes, cspine, cpos, ctsn))
+
+    small_pos = positions_for_small_grid(small_comps)
+    small_tsn = [tsn for tsn in ts_nodes
+                 if any(a in small_pos and b in small_pos for a, b in tsn["pairs"])]
 
     # Merge summary + session save in sidebar
     with st.sidebar:
@@ -1568,6 +1708,38 @@ Switch between slots to load different runs side by side without losing any data
                                 mime="text/plain", use_container_width=True,
                                 key=f"btn_dl_pts_{folder}",
                             )
+
+        if extractmin_files or extractts_files:
+            st.divider()
+            st.caption("Extract coordinate files")
+            if n_atoms is None:
+                st.warning(
+                    "Atom count unknown. Load path.info or set **Number of atoms** "
+                    "to read extract coordinates."
+                )
+            else:
+                if extractmin_files:
+                    if n_exmin_parsed == 0:
+                        st.error(
+                            f"extractmin: could not parse — check the atom count ({n_atoms})."
+                        )
+                    else:
+                        n_extra_exmin = max(0, n_exmin_parsed - len(min_e_base))
+                        msg = f"extractmin: {n_exmin_parsed} structure(s) parsed"
+                        if n_extra_exmin:
+                            msg += f", {n_extra_exmin} beyond min.data"
+                        st.caption(msg)
+                if extractts_files:
+                    if n_exts_parsed == 0:
+                        st.error(
+                            f"extractts: could not parse — check the atom count ({n_atoms})."
+                        )
+                    else:
+                        n_extra_exts = max(0, n_exts_parsed - len(ts_e))
+                        msg = f"extractts: {n_exts_parsed} structure(s) parsed"
+                        if n_extra_exts:
+                            msg += f", {n_extra_exts} beyond ts.data"
+                        st.caption(msg)
 
         st.divider()
         st.caption("Save & share")
@@ -1675,17 +1847,175 @@ Switch between slots to load different runs side by side without losing any data
             f"({sum(1 for ed in edges if ed['source']=='path.info')} from path.info, "
             f"{sum(1 for ed in edges if ed['source']=='ts.data only')} from ts.data only)"
         )
-        spine_str = " → ".join(str(n) for n in spine)
-        st.caption(f"Longest chain ({len(spine)} nodes, centred): {spine_str}")
         graph_col, info_col = st.columns([3, 2])
 
         with graph_col:
-            st.components.v1.html(
-                build_draggable_html(min_e, ts_nodes, node_coords, pos, element,
-                                     knot_types, knot_flags),
-                height=800,
-                scrolling=False,
-            )
+            if not comp_layouts and not small_comps and not isolated_nodes:
+                st.info("No diagram — no nodes loaded.")
+
+            def _near(e):
+                return min(range(len(min_e)), key=lambda j: abs(min_e[j] - e)) + 1
+
+            def _cluster_tables(comp_node_ids, cluster_tsn):
+                """Render min.data, ts.data, extractmin, extractts for one cluster."""
+                sorted_nids = sorted(n for n in comp_node_ids if 0 < n <= len(min_lines))
+
+                with st.expander("min.data — this cluster", expanded=False):
+                    if sorted_nids:
+                        st.code(
+                            "\n".join(min_lines[nid - 1] for nid in sorted_nids),
+                            language=None, line_numbers=True,
+                        )
+                        st.bar_chart(pd.DataFrame(
+                            {"Energy": [min_e[nid - 1] for nid in sorted_nids]},
+                            index=[f"Node {nid}" for nid in sorted_nids],
+                        ))
+                    else:
+                        st.caption("No min.data entries for this cluster.")
+
+                if ts_e:
+                    with st.expander("ts.data — this cluster", expanded=False):
+                        ctsn_e = {tsn["e"] for tsn in cluster_tsn}
+                        ts_lines_cl, ts_ens_cl = [], []
+                        for (te, ea, eb), parts in zip(ts_e, ts_parts):
+                            if te in ctsn_e:
+                                rp = parts[:]
+                                rp[3] = str(_near(ea))
+                                rp[4] = str(_near(eb))
+                                ts_lines_cl.append("    ".join(rp))
+                                ts_ens_cl.append(te)
+                        if ts_lines_cl:
+                            st.code("\n".join(ts_lines_cl), language=None, line_numbers=True)
+                            st.bar_chart(pd.DataFrame(
+                                {"Energy": ts_ens_cl},
+                                index=[f"TS {i + 1}" for i in range(len(ts_ens_cl))],
+                            ))
+                        else:
+                            st.caption("No ts.data entries for this cluster.")
+
+                if parsed_exmin:
+                    with st.expander("extractmin — this cluster", expanded=False):
+                        found = False
+                        for nid in sorted(comp_node_ids):
+                            idx = nid - 1
+                            if idx < len(parsed_exmin):
+                                found = True
+                                st.markdown(f"**Node {nid}**")
+                                st.dataframe(
+                                    pd.DataFrame(
+                                        parsed_exmin[idx],
+                                        columns=["x", "y", "z"],
+                                        index=range(1, len(parsed_exmin[idx]) + 1),
+                                    ),
+                                    use_container_width=True,
+                                )
+                        if not found:
+                            st.caption("No extractmin structures for this cluster.")
+
+                if parsed_exts:
+                    with st.expander("extractts — this cluster", expanded=False):
+                        ts_idx_map = {te: j for j, (te, _, _) in enumerate(ts_e)}
+                        found = False
+                        for tsn in cluster_tsn:
+                            idx = ts_idx_map.get(tsn["e"])
+                            if idx is not None and idx < len(parsed_exts):
+                                found = True
+                                pairs_str = ", ".join(
+                                    f"{a} ↔ {b}" for a, b in tsn["pairs"]
+                                )
+                                st.markdown(f"**{pairs_str}  ·  E = {tsn['e']:.14f}**")
+                                st.dataframe(
+                                    pd.DataFrame(
+                                        parsed_exts[idx],
+                                        columns=["x", "y", "z"],
+                                        index=range(1, len(parsed_exts[idx]) + 1),
+                                    ),
+                                    use_container_width=True,
+                                )
+                        if not found:
+                            st.caption("No extractts structures for this cluster.")
+
+            for ci, (comp_nodes, cspine, cpos, ctsn) in enumerate(comp_layouts):
+                spine_str = " → ".join(str(n) for n in cspine)
+                st.markdown(
+                    f"**Cluster {ci + 1}** — {len(comp_nodes)} minima, "
+                    f"{len(ctsn)} transition states"
+                )
+                st.caption(f"Longest chain ({len(cspine)} nodes, centred): {spine_str}")
+                st.components.v1.html(
+                    build_draggable_html(min_e, ctsn, node_coords, cpos, element,
+                                         knot_types, knot_flags),
+                    height=800,
+                    scrolling=False,
+                )
+                _cluster_tables(comp_nodes, ctsn)
+
+            if small_comps:
+                small_all_nodes = frozenset().union(*small_comps)
+                st.markdown(
+                    f"**Simple pairs** — {len(small_comps)} pair(s) "
+                    f"(2 minima, 1 transition state each)"
+                )
+                st.components.v1.html(
+                    build_draggable_html(min_e, small_tsn, node_coords, small_pos,
+                                         element, knot_types, knot_flags),
+                    height=800,
+                    scrolling=False,
+                )
+                _cluster_tables(small_all_nodes, small_tsn)
+
+            # Extra extractmin/extractts structures beyond what min.data and ts.data cover.
+            # These exist when PATHSAMPLE's EXTRACT produced a larger file than the
+            # current .data files — see Wales Group PATHSAMPLE documentation.
+            _n_known_min = len(min_e_base)
+            if parsed_exmin and len(parsed_exmin) > _n_known_min:
+                _extra_exmin = parsed_exmin[_n_known_min:]
+                with st.expander(
+                    f"extractmin — {len(_extra_exmin)} extra structure(s) beyond min.data",
+                    expanded=False,
+                ):
+                    st.caption(
+                        "These structures are in extractmin but have no corresponding "
+                        "entry in the current min.data. They may come from a larger or "
+                        "different PATHSAMPLE run."
+                    )
+                    for i, coords in enumerate(_extra_exmin):
+                        st.markdown(f"**Structure {_n_known_min + i + 1}**")
+                        st.dataframe(
+                            pd.DataFrame(
+                                coords, columns=["x", "y", "z"],
+                                index=range(1, len(coords) + 1),
+                            ),
+                            use_container_width=True,
+                        )
+
+            _n_known_ts = len(ts_e)
+            if parsed_exts and len(parsed_exts) > _n_known_ts:
+                _extra_exts = parsed_exts[_n_known_ts:]
+                with st.expander(
+                    f"extractts — {len(_extra_exts)} extra structure(s) beyond ts.data",
+                    expanded=False,
+                ):
+                    st.caption(
+                        "These structures are in extractts but have no corresponding "
+                        "entry in the current ts.data. They may come from a larger or "
+                        "different PATHSAMPLE run."
+                    )
+                    for i, coords in enumerate(_extra_exts):
+                        st.markdown(f"**Structure {_n_known_ts + i + 1}**")
+                        st.dataframe(
+                            pd.DataFrame(
+                                coords, columns=["x", "y", "z"],
+                                index=range(1, len(coords) + 1),
+                            ),
+                            use_container_width=True,
+                        )
+
+            if isolated_nodes:
+                st.caption(
+                    "Isolated minima (no transition states): "
+                    + ", ".join(str(n) for n in isolated_nodes)
+                )
 
         with info_col:
             sel_options = [None] + list(range(1, len(min_e) + 1))
