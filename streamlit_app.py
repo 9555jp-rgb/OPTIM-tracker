@@ -1280,8 +1280,16 @@ def main():
                                          placeholder="6-digit code — enter just before clicking Fetch")
                 ssh_key  = st.text_input("Key file (optional)", key="ssh_key",
                                          placeholder="~/.ssh/id_rsa")
-                ssh_dir  = st.text_input("Results directory", key="ssh_dir",
-                                         placeholder="~/7_1_op/optimization  or full path")
+                ssh_dir  = st.text_input(
+                    "PATHSAMPLE directory (min.data, ts.data, points.min, points.ts, extractmin, extractts)",
+                    key="ssh_dir",
+                    placeholder="~/7_1_op/pathsample.new4/pathsample-initialise",
+                )
+                ssh_dir_optim = st.text_input(
+                    "OPTIM directory (path.info) — leave blank to use PATHSAMPLE directory",
+                    key="ssh_dir_optim",
+                    placeholder="~/7_1_op/optimization",
+                )
 
                 col_fetch, col_clear = st.columns(2)
                 fetch_clicked = col_fetch.button("Fetch", use_container_width=True)
@@ -1293,6 +1301,7 @@ def main():
                     st.rerun()
 
                 if fetch_clicked and ssh_host and ssh_user and ssh_dir:
+                    ssh_dir_optim = ssh_dir_optim.strip() or ssh_dir.strip()
                     with st.spinner("Connecting…"):
                         try:
                             t = paramiko.Transport((ssh_host, int(ssh_port)))
@@ -1316,20 +1325,32 @@ def main():
                                     return responses
                                 t.auth_interactive(ssh_user, _kbd)
                             # Resolve ~ to the actual home directory on the server
-                            resolved_dir = ssh_dir.strip()
-                            if resolved_dir.startswith("~"):
-                                chan = t.open_session()
-                                chan.exec_command("echo $HOME")
-                                home = chan.makefile().read().decode().strip()
-                                chan.recv_exit_status()
-                                chan.close()
-                                resolved_dir = home + resolved_dir[1:]
+                            def _resolve(d):
+                                d = d.strip()
+                                if d.startswith("~"):
+                                    chan = t.open_session()
+                                    chan.exec_command("echo $HOME")
+                                    home = chan.makefile().read().decode().strip()
+                                    chan.recv_exit_status()
+                                    chan.close()
+                                    d = home + d[1:]
+                                return d
+                            resolved_dir       = _resolve(ssh_dir.strip())
+                            resolved_dir_optim = _resolve(ssh_dir_optim)
                             fetched = {}
                             binary_fetched = {}
                             file_errors = {}
+                            # path.info lives in the OPTIM directory; everything else in PATHSAMPLE
+                            _text_file_dirs = {
+                                "min.data":  resolved_dir,
+                                "ts.data":   resolved_dir,
+                                "path.info": resolved_dir_optim,
+                                "extractmin": resolved_dir,
+                                "extractts":  resolved_dir,
+                            }
                             for fname in ["min.data", "ts.data", "path.info",
                                           "extractmin", "extractts"]:
-                                remote = f"{resolved_dir.rstrip('/')}/{fname}"
+                                remote = f"{_text_file_dirs[fname].rstrip('/')}/{fname}"
                                 tmp = None
                                 try:
                                     fd, tmp = tempfile.mkstemp()
