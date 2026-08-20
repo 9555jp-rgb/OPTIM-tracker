@@ -266,7 +266,7 @@ def convert_points_binary(raw_bytes, n_atoms):
 
 
 def parse_extract_text(text, n_atoms):
-    """Parse a plain-text coordinate file (extractmin or extractts).
+    """Parse a plain-text coordinate file (extractedmin or extractedts).
 
     Reads lines of 3 floats (or element + 3 floats) and groups them into
     structures of n_atoms atoms each. Returns a list of [[x, y, z], ...] blocks.
@@ -1260,9 +1260,9 @@ def main():
 
         st.divider()
         st.caption("Plain text coordinate files (from PATHSAMPLE EXTRACT).")
-        up_extractmin = st.file_uploader("extractmin", accept_multiple_files=False,
+        up_extractmin = st.file_uploader("extractedmin", accept_multiple_files=False,
                                          key=f"up_exmin_{folder}")
-        up_extractts  = st.file_uploader("extractts",  accept_multiple_files=False,
+        up_extractts  = st.file_uploader("extractedts",  accept_multiple_files=False,
                                          key=f"up_exts_{folder}")
 
         st.divider()
@@ -1281,7 +1281,7 @@ def main():
                 ssh_key  = st.text_input("Key file (optional)", key="ssh_key",
                                          placeholder="~/.ssh/id_rsa")
                 ssh_dir  = st.text_input(
-                    "PATHSAMPLE directory (min.data, ts.data, points.min, points.ts, extractmin, extractts)",
+                    "PATHSAMPLE directory (min.data, ts.data, points.min, points.ts, extractedmin, extractedts)",
                     key="ssh_dir",
                     placeholder="~/7_1_op/pathsample.new4/pathsample-initialise",
                 )
@@ -1345,11 +1345,11 @@ def main():
                                 "min.data":  resolved_dir,
                                 "ts.data":   resolved_dir,
                                 "path.info": resolved_dir_optim,
-                                "extractmin": resolved_dir,
-                                "extractts":  resolved_dir,
+                                "extractedmin": resolved_dir,
+                                "extractedts":  resolved_dir,
                             }
                             for fname in ["min.data", "ts.data", "path.info",
-                                          "extractmin", "extractts"]:
+                                          "extractedmin", "extractedts"]:
                                 remote = f"{_text_file_dirs[fname].rstrip('/')}/{fname}"
                                 tmp = None
                                 try:
@@ -1453,7 +1453,7 @@ The file is too large to copy and paste by hand without risk of truncation.
 
 You can upload more than one file into each slot. Duplicates are removed automatically.
 
-**extractmin** and **extractts** are plain-text coordinate files produced by PATHSAMPLE's EXTRACT keyword. They give atomic coordinates for each minimum and transition state in the same order as min.data and ts.data. These files may be larger than the .data files — extra structures beyond the current min.data or ts.data are listed separately in the spider web tab. Set the atom count in the sidebar before loading them. See the Wales Group PATHSAMPLE documentation for details on the EXTRACT keyword and output format.
+**extractedmin** and **extractedts** are plain-text coordinate files produced by PATHSAMPLE's EXTRACT keyword. They give atomic coordinates for each minimum and transition state in the same order as min.data and ts.data. These files may be larger than the .data files — extra structures beyond the current min.data or ts.data are listed separately in the spider web tab. Set the atom count in the sidebar before loading them. See the Wales Group PATHSAMPLE documentation for details on the EXTRACT keyword and output format.
 """
             )
             st.markdown("### The spider web diagram")
@@ -1542,10 +1542,10 @@ Switch between slots to load different runs side by side without losing any data
         [up_points_ts] if up_points_ts is not None else [], "points.ts", folder
     )
     extractmin_files = read_files(
-        [up_extractmin] if up_extractmin is not None else [], "extractmin", folder
+        [up_extractmin] if up_extractmin is not None else [], "extractedmin", folder
     )
     extractts_files = read_files(
-        [up_extractts] if up_extractts is not None else [], "extractts", folder
+        [up_extractts] if up_extractts is not None else [], "extractedts", folder
     )
 
     if not min_files and not path_files:
@@ -1743,22 +1743,22 @@ Switch between slots to load different runs side by side without losing any data
                 if extractmin_files:
                     if n_exmin_parsed == 0:
                         st.error(
-                            f"extractmin: could not parse — check the atom count ({n_atoms})."
+                            f"extractedmin: could not parse — check the atom count ({n_atoms})."
                         )
                     else:
                         n_extra_exmin = max(0, n_exmin_parsed - len(min_e_base))
-                        msg = f"extractmin: {n_exmin_parsed} structure(s) parsed"
+                        msg = f"extractedmin: {n_exmin_parsed} structure(s) parsed"
                         if n_extra_exmin:
                             msg += f", {n_extra_exmin} beyond min.data"
                         st.caption(msg)
                 if extractts_files:
                     if n_exts_parsed == 0:
                         st.error(
-                            f"extractts: could not parse — check the atom count ({n_atoms})."
+                            f"extractedts: could not parse — check the atom count ({n_atoms})."
                         )
                     else:
                         n_extra_exts = max(0, n_exts_parsed - len(ts_e))
-                        msg = f"extractts: {n_exts_parsed} structure(s) parsed"
+                        msg = f"extractedts: {n_exts_parsed} structure(s) parsed"
                         if n_extra_exts:
                             msg += f", {n_extra_exts} beyond ts.data"
                         st.caption(msg)
@@ -1879,7 +1879,7 @@ Switch between slots to load different runs side by side without losing any data
                 return min(range(len(min_e)), key=lambda j: abs(min_e[j] - e)) + 1
 
             def _cluster_tables(comp_node_ids, cluster_tsn):
-                """Render min.data, ts.data, extractmin, extractts for one cluster."""
+                """Render min.data, ts.data, extractedmin, extractedts for one cluster."""
                 sorted_nids = sorted(n for n in comp_node_ids if 0 < n <= len(min_lines))
 
                 with st.expander("min.data — this cluster", expanded=False):
@@ -1916,7 +1916,7 @@ Switch between slots to load different runs side by side without losing any data
                             st.caption("No ts.data entries for this cluster.")
 
                 if parsed_exmin:
-                    with st.expander("extractmin — this cluster", expanded=False):
+                    with st.expander("extractedmin — this cluster", expanded=False):
                         found = False
                         for nid in sorted(comp_node_ids):
                             idx = nid - 1
@@ -1932,10 +1932,10 @@ Switch between slots to load different runs side by side without losing any data
                                     use_container_width=True,
                                 )
                         if not found:
-                            st.caption("No extractmin structures for this cluster.")
+                            st.caption("No extractedmin structures for this cluster.")
 
                 if parsed_exts:
-                    with st.expander("extractts — this cluster", expanded=False):
+                    with st.expander("extractedts — this cluster", expanded=False):
                         ts_idx_map = {te: j for j, (te, _, _) in enumerate(ts_e)}
                         found = False
                         for tsn in cluster_tsn:
@@ -1955,7 +1955,7 @@ Switch between slots to load different runs side by side without losing any data
                                     use_container_width=True,
                                 )
                         if not found:
-                            st.caption("No extractts structures for this cluster.")
+                            st.caption("No extractedts structures for this cluster.")
 
             for ci, (comp_nodes, cspine, cpos, ctsn) in enumerate(comp_layouts):
                 spine_str = " → ".join(str(n) for n in cspine)
@@ -1986,18 +1986,18 @@ Switch between slots to load different runs side by side without losing any data
                 )
                 _cluster_tables(small_all_nodes, small_tsn)
 
-            # Extra extractmin/extractts structures beyond what min.data and ts.data cover.
+            # Extra extractedmin/extractedts structures beyond what min.data and ts.data cover.
             # These exist when PATHSAMPLE's EXTRACT produced a larger file than the
             # current .data files — see Wales Group PATHSAMPLE documentation.
             _n_known_min = len(min_e_base)
             if parsed_exmin and len(parsed_exmin) > _n_known_min:
                 _extra_exmin = parsed_exmin[_n_known_min:]
                 with st.expander(
-                    f"extractmin — {len(_extra_exmin)} extra structure(s) beyond min.data",
+                    f"extractedmin — {len(_extra_exmin)} extra structure(s) beyond min.data",
                     expanded=False,
                 ):
                     st.caption(
-                        "These structures are in extractmin but have no corresponding "
+                        "These structures are in extractedmin but have no corresponding "
                         "entry in the current min.data. They may come from a larger or "
                         "different PATHSAMPLE run."
                     )
@@ -2015,11 +2015,11 @@ Switch between slots to load different runs side by side without losing any data
             if parsed_exts and len(parsed_exts) > _n_known_ts:
                 _extra_exts = parsed_exts[_n_known_ts:]
                 with st.expander(
-                    f"extractts — {len(_extra_exts)} extra structure(s) beyond ts.data",
+                    f"extractedts — {len(_extra_exts)} extra structure(s) beyond ts.data",
                     expanded=False,
                 ):
                     st.caption(
-                        "These structures are in extractts but have no corresponding "
+                        "These structures are in extractedts but have no corresponding "
                         "entry in the current ts.data. They may come from a larger or "
                         "different PATHSAMPLE run."
                     )
