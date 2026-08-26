@@ -1798,13 +1798,9 @@ Switch between slots to load different runs side by side without losing any data
                         if n_extra_exmin:
                             msg += f", {n_extra_exmin} beyond min.data"
                         st.caption(msg)
-                        exmin_dl = "\n".join(
-                            f"{x:25.15f}{y:25.15f}{z:25.15f}"
-                            for block in parsed_exmin for x, y, z in block
-                        )
                         st.download_button(
                             "Download extractedmin",
-                            data=exmin_dl,
+                            data=extractmin_files[0][1],
                             file_name="extractedmin",
                             mime="text/plain",
                             use_container_width=True,
@@ -1821,13 +1817,9 @@ Switch between slots to load different runs side by side without losing any data
                         if n_extra_exts:
                             msg += f", {n_extra_exts} beyond ts.data"
                         st.caption(msg)
-                        exts_dl = "\n".join(
-                            f"{x:25.15f}{y:25.15f}{z:25.15f}"
-                            for block in parsed_exts for x, y, z in block
-                        )
                         st.download_button(
                             "Download extractedts",
-                            data=exts_dl,
+                            data=extractts_files[0][1],
                             file_name="extractedts",
                             mime="text/plain",
                             use_container_width=True,
@@ -1949,7 +1941,7 @@ Switch between slots to load different runs side by side without losing any data
             def _near(e):
                 return min(range(len(min_e)), key=lambda j: abs(min_e[j] - e)) + 1
 
-            def _cluster_tables(comp_node_ids, cluster_tsn):
+            def _cluster_tables(comp_node_ids, cluster_tsn, key_suffix=""):
                 """Render min.data, ts.data, extractedmin, extractedts for one cluster."""
                 sorted_nids = sorted(n for n in comp_node_ids if 0 < n <= len(min_lines))
 
@@ -2028,6 +2020,27 @@ Switch between slots to load different runs side by side without losing any data
                         if not found:
                             st.caption("No extractedts structures for this cluster.")
 
+                if triplets:
+                    cluster_node_set = frozenset(comp_node_ids)
+                    cluster_triplets = [
+                        (mA, ts_s, mB) for mA, ts_s, mB in triplets
+                        if _near(mA["e"]) in cluster_node_set
+                        and _near(mB["e"]) in cluster_node_set
+                    ]
+                    with st.expander("path.info — this cluster", expanded=False):
+                        if cluster_triplets:
+                            st.caption(f"{len(cluster_triplets)} triplet(s)")
+                            st.download_button(
+                                "Download path.info (this cluster)",
+                                data=reconstruct_path(cluster_triplets),
+                                file_name="path.info",
+                                mime="text/plain",
+                                use_container_width=True,
+                                key=f"btn_dl_path_cl_{key_suffix}_{folder}",
+                            )
+                        else:
+                            st.caption("No path.info triplets for this cluster.")
+
             for ci, (comp_nodes, cspine, cpos, ctsn) in enumerate(comp_layouts):
                 spine_str = " → ".join(str(n) for n in cspine)
                 st.markdown(
@@ -2041,7 +2054,7 @@ Switch between slots to load different runs side by side without losing any data
                     height=800,
                     scrolling=False,
                 )
-                _cluster_tables(comp_nodes, ctsn)
+                _cluster_tables(comp_nodes, ctsn, key_suffix=ci)
 
             if small_comps:
                 small_all_nodes = frozenset().union(*small_comps)
@@ -2055,7 +2068,7 @@ Switch between slots to load different runs side by side without losing any data
                     height=800,
                     scrolling=False,
                 )
-                _cluster_tables(small_all_nodes, small_tsn)
+                _cluster_tables(small_all_nodes, small_tsn, key_suffix="small")
 
             # Extra extractedmin/extractedts structures beyond what min.data and ts.data cover.
             # These exist when PATHSAMPLE's EXTRACT produced a larger file than the
