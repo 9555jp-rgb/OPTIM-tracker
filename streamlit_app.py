@@ -32,6 +32,12 @@ _DEFAULTS = {
     "min.data":  os.path.join(_BASE, "Results", "PATHSAMPLE", "min.data"),
     "ts.data":   os.path.join(_BASE, "Results", "PATHSAMPLE", "ts.data"),
     "path.info": os.path.join(_BASE, "Results", "OPTIM",      "path.info"),
+    "path.info.start.done": os.path.join(_BASE, "Results", "OPTIM", "path.info.start.done"),
+}
+
+# Alternative file names accepted for the same data slot.
+_PATH_ALIASES = {
+    "path.info": ["path.info", "path.info.start.done"],
 }
 
 
@@ -50,15 +56,20 @@ def read_files(uploaded_list, key, folder="0"):
                 f"(e.g. a Word document). `{key}` must be a plain text file."
             )
     ssh_files = st.session_state.get(f"ssh_files_{folder}", {})
-    if key in ssh_files:
-        results.append(ssh_files[key])
-    for name, text in st.session_state.get(f"saved_session_{folder}", {}).get(key, []):
-        results.append((name, text))
+    for k in _PATH_ALIASES.get(key, [key]):
+        if k in ssh_files:
+            results.append(ssh_files[k])
+    saved = st.session_state.get(f"saved_session_{folder}", {})
+    for k in _PATH_ALIASES.get(key, [key]):
+        for name, text in saved.get(k, []):
+            results.append((name, text))
     if not results:
-        path = _DEFAULTS.get(key)
-        if path and os.path.exists(path):
-            with open(path, encoding="utf-8") as fh:
-                results.append((os.path.basename(path), fh.read()))
+        for k in _PATH_ALIASES.get(key, [key]):
+            path = _DEFAULTS.get(k)
+            if path and os.path.exists(path):
+                with open(path, encoding="utf-8") as fh:
+                    results.append((os.path.basename(path), fh.read()))
+                break
     return results
 
 
@@ -120,22 +131,32 @@ def parse_path(text):
         except ValueError:
             i += 1
             continue
+        energy_line = lines[i]
         i += 1
+        sym = "1"
+        sym_line = ""
         if i < len(lines):
-            i += 1          # skip symmetry line
+            sym_line = lines[i]
+            sym = lines[i].strip()
+            i += 1
+        coord_lines = []
         coords = []
         while i < len(lines):
             parts = lines[i].split()
             if len(parts) == 3:
                 try:
                     coords.append([float(x) for x in parts])
+                    coord_lines.append(lines[i])
                     i += 1
                 except ValueError:
                     break
             else:
                 break
         if coords:
-            structures.append({"e": energy, "c": coords})
+            structures.append({
+                "e": energy, "c": coords, "sym": sym,
+                "raw": [energy_line, sym_line] + coord_lines,
+            })
     return [
         (structures[k], structures[k + 1], structures[k + 2])
         for k in range(0, len(structures) - 2, 3)
@@ -309,6 +330,26 @@ def merge_path(file_texts):
         stats.append({"file": fname, "entries": len(triplets),
                       "new": added, "duplicates removed": dup})
     return merged, stats
+
+
+def reconstruct_path(triplets):
+    """Rebuild path.info text from parsed triplets for round-trip use with OPTIM.
+
+    Format per structure: energy line, symmetry number, then one 'x  y  z' coordinate line
+    per atom. The symmetry value defaults to '1' for structures parsed before this field
+    was captured.
+    """
+    out = []
+    for mA, ts, mB in triplets:
+        for struct in (mA, ts, mB):
+            if "raw" in struct:
+                out.extend(struct["raw"])
+            else:
+                out.append(f"    {struct['e']:.12f}")
+                out.append(struct.get("sym", "1"))
+                for x, y, z in struct["c"]:
+                    out.append(f"{x:25.13f}{y:25.13f}{z:25.13f}")
+    return "\n".join(out)
 
 
 # ── Network construction ──────────────────────────────────────────────────────
@@ -1244,7 +1285,7 @@ def main():
         st.caption("Each uploader accepts multiple files. Duplicates are removed automatically.")
         up_min  = st.file_uploader("min.data",  accept_multiple_files=True, key=f"up_min_{folder}")
         up_ts   = st.file_uploader("ts.data",   accept_multiple_files=True, key=f"up_ts_{folder}")
-        up_path = st.file_uploader("path.info", accept_multiple_files=True, key=f"up_path_{folder}")
+        up_path = st.file_uploader("path.info / path.info.start.done", accept_multiple_files=True, key=f"up_path_{folder}")
 
         st.divider()
         st.caption("Binary coordinate files (Fortran unformatted).")
@@ -1350,21 +1391,27 @@ def main():
                             }
                             for fname in ["min.data", "ts.data", "path.info",
                                           "extractedmin", "extractedts"]:
-                                remote = f"{_text_file_dirs[fname].rstrip('/')}/{fname}"
-                                tmp = None
-                                try:
-                                    fd, tmp = tempfile.mkstemp()
-                                    os.close(fd)
-                                    with _SCPClient(t) as scp:
-                                        scp.get(remote, tmp)
-                                    with open(tmp, encoding="utf-8") as fh:
-                                        text = fh.read()
-                                    fetched[fname] = (f"{ssh_host}:{fname}", text)
-                                except Exception as fe:
-                                    file_errors[fname] = str(fe)
-                                finally:
-                                    if tmp and os.path.exists(tmp):
-                                        os.unlink(tmp)
+                                candidates = _PATH_ALIASES.get(fname, [fname])
+                                remote_dir = _text_file_dirs.get(fname, resolved_dir)
+                                fetched_this = False
+                                for candidate in candidates:
+                                    remote = f"{remote_dir.rstrip('/')}/{candidate}"
+                                    tmp = None
+                                    try:
+                                        fd, tmp = tempfile.mkstemp()
+                                        os.close(fd)
+                                        with _SCPClient(t) as scp:
+                                            scp.get(remote, tmp)
+                                        with open(tmp, encoding="utf-8") as fh:
+                                            text = fh.read()
+                                        fetched[fname] = (f"{ssh_host}:{candidate}", text)
+                                        fetched_this = True
+                                        break
+                                    except Exception as fe:
+                                        file_errors[candidate] = str(fe)
+                                    finally:
+                                        if tmp and os.path.exists(tmp):
+                                            os.unlink(tmp)
                             for fname in ["points.min", "points.ts"]:
                                 remote = f"{resolved_dir.rstrip('/')}/{fname}"
                                 tmp = None
@@ -1751,6 +1798,18 @@ Switch between slots to load different runs side by side without losing any data
                         if n_extra_exmin:
                             msg += f", {n_extra_exmin} beyond min.data"
                         st.caption(msg)
+                        exmin_dl = "\n".join(
+                            f"{x:25.15f}{y:25.15f}{z:25.15f}"
+                            for block in parsed_exmin for x, y, z in block
+                        )
+                        st.download_button(
+                            "Download extractedmin",
+                            data=exmin_dl,
+                            file_name="extractedmin",
+                            mime="text/plain",
+                            use_container_width=True,
+                            key=f"btn_dl_exmin_{folder}",
+                        )
                 if extractts_files:
                     if n_exts_parsed == 0:
                         st.error(
@@ -1762,6 +1821,18 @@ Switch between slots to load different runs side by side without losing any data
                         if n_extra_exts:
                             msg += f", {n_extra_exts} beyond ts.data"
                         st.caption(msg)
+                        exts_dl = "\n".join(
+                            f"{x:25.15f}{y:25.15f}{z:25.15f}"
+                            for block in parsed_exts for x, y, z in block
+                        )
+                        st.download_button(
+                            "Download extractedts",
+                            data=exts_dl,
+                            file_name="extractedts",
+                            mime="text/plain",
+                            use_container_width=True,
+                            key=f"btn_dl_exts_{folder}",
+                        )
 
         st.divider()
         st.caption("Save & share")
@@ -2148,6 +2219,14 @@ Switch between slots to load different runs side by side without losing any data
         st.subheader("Minimum energies (min.data)")
         st.caption("Merged result — line number = node number.")
         st.code("\n".join(min_lines), language=None, line_numbers=True)
+        st.download_button(
+            "Download min.data",
+            data="\n".join(min_lines),
+            file_name="min.data",
+            mime="text/plain",
+            use_container_width=True,
+            key=f"btn_dl_min_{folder}",
+        )
 
         if len(min_stats) > 1:
             st.divider()
@@ -2178,11 +2257,29 @@ Switch between slots to load different runs side by side without losing any data
             )
             reindexed = []
             for (_, ea, eb), parts in zip(ts_e, ts_parts):
-                new_parts = parts[:]
-                new_parts[3] = str(_nearest(ea))
-                new_parts[4] = str(_nearest(eb))
-                reindexed.append("    ".join(new_parts))
+                new_A = _nearest(ea)
+                new_B = _nearest(eb)
+                # Reproduce Fortran field widths: e(25) freq(25) n_fv(10) A(10) B(10) Ix(20) Iy(20) Iz(20)
+                # Original string tokens preserve exact float values; only A and B change.
+                e_s    = parts[0]
+                freq_s = parts[1] if len(parts) > 1 else "1.000000000000000"
+                nfv_s  = parts[2] if len(parts) > 2 else "1"
+                Ix_s   = parts[5] if len(parts) > 5 else ""
+                Iy_s   = parts[6] if len(parts) > 6 else ""
+                Iz_s   = parts[7] if len(parts) > 7 else ""
+                line   = (f"{e_s:>25}{freq_s:>25}{nfv_s:>10}"
+                          f"{new_A:10d}{new_B:10d}"
+                          f"{Ix_s:>20}{Iy_s:>20}{Iz_s:>20}")
+                reindexed.append(line.rstrip())
             st.code("\n".join(reindexed), language=None, line_numbers=True)
+            st.download_button(
+                "Download ts.data",
+                data="\n".join(reindexed),
+                file_name="ts.data",
+                mime="text/plain",
+                use_container_width=True,
+                key=f"btn_dl_ts_{folder}",
+            )
 
             if len(ts_stats) > 1:
                 st.divider()
@@ -2243,6 +2340,14 @@ Switch between slots to load different runs side by side without losing any data
                 block_lines.append(f"{mB['e']:.14f}")
                 block_lines.append("")
             st.code("\n".join(block_lines), language=None, line_numbers=True)
+            st.download_button(
+                "Download path.info",
+                data=reconstruct_path(triplets),
+                file_name="path.info",
+                mime="text/plain",
+                use_container_width=True,
+                key=f"btn_dl_path_{folder}",
+            )
 
             if len(path_stats) > 1:
                 st.divider()
