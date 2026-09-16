@@ -1947,14 +1947,20 @@ Switch between slots to load different runs side by side without losing any data
 
                 with st.expander("min.data — this cluster", expanded=False):
                     if sorted_nids:
-                        st.code(
-                            "\n".join(min_lines[nid - 1] for nid in sorted_nids),
-                            language=None, line_numbers=True,
-                        )
+                        min_cl_text = "\n".join(min_lines[nid - 1] for nid in sorted_nids)
+                        st.code(min_cl_text, language=None, line_numbers=True)
                         st.bar_chart(pd.DataFrame(
                             {"Energy": [min_e[nid - 1] for nid in sorted_nids]},
                             index=[f"Node {nid}" for nid in sorted_nids],
                         ))
+                        st.download_button(
+                            "Download min.data (this cluster)",
+                            data=min_cl_text,
+                            file_name="min.data",
+                            mime="text/plain",
+                            use_container_width=True,
+                            key=f"btn_dl_min_cl_{key_suffix}_{folder}",
+                        )
                     else:
                         st.caption("No min.data entries for this cluster.")
 
@@ -1964,60 +1970,82 @@ Switch between slots to load different runs side by side without losing any data
                         ts_lines_cl, ts_ens_cl = [], []
                         for (te, ea, eb), parts in zip(ts_e, ts_parts):
                             if te in ctsn_e:
-                                rp = parts[:]
-                                rp[3] = str(_near(ea))
-                                rp[4] = str(_near(eb))
-                                ts_lines_cl.append("    ".join(rp))
+                                e_s    = parts[0]
+                                freq_s = parts[1] if len(parts) > 1 else "1.000000000000000"
+                                nfv_s  = parts[2] if len(parts) > 2 else "1"
+                                Ix_s   = parts[5] if len(parts) > 5 else ""
+                                Iy_s   = parts[6] if len(parts) > 6 else ""
+                                Iz_s   = parts[7] if len(parts) > 7 else ""
+                                line   = (f"{e_s:>25}{freq_s:>25}{nfv_s:>10}"
+                                          f"{_near(ea):10d}{_near(eb):10d}"
+                                          f"{Ix_s:>20}{Iy_s:>20}{Iz_s:>20}")
+                                ts_lines_cl.append(line.rstrip())
                                 ts_ens_cl.append(te)
                         if ts_lines_cl:
-                            st.code("\n".join(ts_lines_cl), language=None, line_numbers=True)
+                            ts_cl_text = "\n".join(ts_lines_cl)
+                            st.code(ts_cl_text, language=None, line_numbers=True)
                             st.bar_chart(pd.DataFrame(
                                 {"Energy": ts_ens_cl},
                                 index=[f"TS {i + 1}" for i in range(len(ts_ens_cl))],
                             ))
+                            st.download_button(
+                                "Download ts.data (this cluster)",
+                                data=ts_cl_text,
+                                file_name="ts.data",
+                                mime="text/plain",
+                                use_container_width=True,
+                                key=f"btn_dl_ts_cl_{key_suffix}_{folder}",
+                            )
                         else:
                             st.caption("No ts.data entries for this cluster.")
 
-                if parsed_exmin:
+                if parsed_exmin and extractmin_files and n_atoms:
                     with st.expander("extractedmin — this cluster", expanded=False):
-                        found = False
+                        raw_exmin = [l for l in extractmin_files[0][1].splitlines() if l.strip()]
+                        lines = []
                         for nid in sorted(comp_node_ids):
-                            idx = nid - 1
-                            if idx < len(parsed_exmin):
-                                found = True
-                                st.markdown(f"**Node {nid}**")
-                                st.dataframe(
-                                    pd.DataFrame(
-                                        parsed_exmin[idx],
-                                        columns=["x", "y", "z"],
-                                        index=range(1, len(parsed_exmin[idx]) + 1),
-                                    ),
-                                    use_container_width=True,
-                                )
-                        if not found:
+                            start = (nid - 1) * n_atoms
+                            end = nid * n_atoms
+                            if end <= len(raw_exmin):
+                                lines.extend(raw_exmin[start:end])
+                        if lines:
+                            exmin_cl_text = "\n".join(lines)
+                            st.code(exmin_cl_text, language=None)
+                            st.download_button(
+                                "Download extractedmin (this cluster)",
+                                data=exmin_cl_text,
+                                file_name="extractedmin",
+                                mime="text/plain",
+                                use_container_width=True,
+                                key=f"btn_dl_exmin_cl_{key_suffix}_{folder}",
+                            )
+                        else:
                             st.caption("No extractedmin structures for this cluster.")
 
-                if parsed_exts:
+                if parsed_exts and extractts_files and n_atoms:
                     with st.expander("extractedts — this cluster", expanded=False):
                         ts_idx_map = {te: j for j, (te, _, _) in enumerate(ts_e)}
-                        found = False
+                        raw_exts = [l for l in extractts_files[0][1].splitlines() if l.strip()]
+                        lines = []
                         for tsn in cluster_tsn:
                             idx = ts_idx_map.get(tsn["e"])
-                            if idx is not None and idx < len(parsed_exts):
-                                found = True
-                                pairs_str = ", ".join(
-                                    f"{a} ↔ {b}" for a, b in tsn["pairs"]
-                                )
-                                st.markdown(f"**{pairs_str}  ·  E = {tsn['e']:.14f}**")
-                                st.dataframe(
-                                    pd.DataFrame(
-                                        parsed_exts[idx],
-                                        columns=["x", "y", "z"],
-                                        index=range(1, len(parsed_exts[idx]) + 1),
-                                    ),
-                                    use_container_width=True,
-                                )
-                        if not found:
+                            if idx is not None:
+                                start = idx * n_atoms
+                                end = (idx + 1) * n_atoms
+                                if end <= len(raw_exts):
+                                    lines.extend(raw_exts[start:end])
+                        if lines:
+                            exts_cl_text = "\n".join(lines)
+                            st.code(exts_cl_text, language=None)
+                            st.download_button(
+                                "Download extractedts (this cluster)",
+                                data=exts_cl_text,
+                                file_name="extractedts",
+                                mime="text/plain",
+                                use_container_width=True,
+                                key=f"btn_dl_exts_cl_{key_suffix}_{folder}",
+                            )
+                        else:
                             st.caption("No extractedts structures for this cluster.")
 
                 if triplets:
@@ -2413,6 +2441,7 @@ Switch between slots to load different runs side by side without losing any data
                     ),
                     use_container_width=True,
                 )
+
 
 
 main()
