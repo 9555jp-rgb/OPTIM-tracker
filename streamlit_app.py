@@ -2079,6 +2079,73 @@ Switch between slots to load different runs side by side without losing any data
                         else:
                             st.caption("No extractedts structures for this cluster.")
 
+                # ── pairs.data ──────────────────────────────────────────
+                with st.expander("pairs.data — this cluster", expanded=False):
+                    # Build the set of pairs already connected by a TS (local indices).
+                    ctsn_e_set = {tsn["e"] for tsn in cluster_tsn}
+                    existing_pairs = set()
+                    for (te, ea, eb), _ in zip(ts_e, ts_parts):
+                        if te not in ctsn_e_set:
+                            continue
+                        la = global_to_local.get(_near(ea))
+                        lb = global_to_local.get(_near(eb))
+                        if la is not None and lb is not None:
+                            existing_pairs.add((min(la, lb), max(la, lb)))
+                    # All unconnected pairs, capped to avoid overwhelming OPTIM.
+                    _MAX_PAIRS = 200
+                    n_local = len(sorted_nids)
+                    missing_pairs = []
+                    for _a in range(1, n_local + 1):
+                        for _b in range(_a + 1, n_local + 1):
+                            if (_a, _b) not in existing_pairs:
+                                missing_pairs.append((_a, _b))
+                    truncated = len(missing_pairs) > _MAX_PAIRS
+                    if truncated:
+                        missing_pairs = missing_pairs[:_MAX_PAIRS]
+                    if missing_pairs:
+                        pairs_text = "\n".join(f"{_a:6d}{_b:6d}"
+                                               for _a, _b in missing_pairs)
+                        st.caption(
+                            f"{len(missing_pairs)} unconnected pair(s) listed"
+                            + (f" (capped at {_MAX_PAIRS})" if truncated else "")
+                            + ". Indices match the local min.data above."
+                        )
+                        st.code(pairs_text, language=None, line_numbers=True)
+                        st.download_button(
+                            "Download pairs.data (this cluster)",
+                            data=pairs_text,
+                            file_name="pairs.data",
+                            mime="text/plain",
+                            use_container_width=True,
+                            key=f"btn_dl_pairs_cl_{key_suffix}_{folder}",
+                        )
+                    else:
+                        st.caption("All pairs in this cluster are already directly connected.")
+
+                    st.divider()
+                    st.caption(
+                        "**Before seeding PATHSAMPLE from this cluster, check the following:**\n\n"
+                        "1. **pathdata — NMIN:** update to match the number of minima in this cluster "
+                        f"({n_local}).\n\n"
+                        "2. **pathdata — endpoint indices (NMIN A / NMIN B):** these reference "
+                        "min.data row numbers. Update them to the local indices of your chosen "
+                        "start and end structures (1–"
+                        f"{n_local}).\n\n"
+                        "3. **points.min / points.ts:** the app produces text extractedmin and "
+                        "extractedts files, but PATHSAMPLE reads binary points.min and points.ts. "
+                        "You must run PATHSAMPLE EXTRACT on the full database to get these, then "
+                        "slice the relevant structures, or convert using the download above.\n\n"
+                        "4. **odata / odata.connect:** OPTIM job files reference atom count and "
+                        "energy function — these do not change and can be reused.\n\n"
+                        "5. **MAXTSENERGY in pathdata:** if set, verify the value is still "
+                        "appropriate for this cluster's energy range.\n\n"
+                        "6. **TEMPERATURE in pathdata:** no change needed.\n\n"
+                        "7. **path.info-only edges:** connections that exist only in path.info "
+                        "(not in ts.data) are not included in the local ts.data download. "
+                        "PATHSAMPLE will not know about them unless you also supply the "
+                        "cluster path.info as path.info.start.done."
+                    )
+
                 if triplets:
                     cluster_node_set = frozenset(comp_node_ids)
                     cluster_triplets = [
