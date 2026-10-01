@@ -1942,16 +1942,27 @@ Switch between slots to load different runs side by side without losing any data
                 return min(range(len(min_e)), key=lambda j: abs(min_e[j] - e)) + 1
 
             def _cluster_tables(comp_node_ids, cluster_tsn, key_suffix=""):
-                """Render min.data, ts.data, extractedmin, extractedts for one cluster."""
+                """Render min.data, ts.data, extractedmin, extractedts for one cluster.
+
+                Minima are renumbered 1..N within each cluster so the downloaded files
+                can seed a fresh PATHSAMPLE run without modification.
+                """
                 sorted_nids = sorted(n for n in comp_node_ids if 0 < n <= len(min_lines))
+                # Local 1-based index for each global node ID, in sorted order.
+                global_to_local = {nid: i + 1 for i, nid in enumerate(sorted_nids)}
 
                 with st.expander("min.data — this cluster", expanded=False):
                     if sorted_nids:
                         min_cl_text = "\n".join(min_lines[nid - 1] for nid in sorted_nids)
+                        st.caption(
+                            f"Minima renumbered 1–{len(sorted_nids)} for PATHSAMPLE seeding. "
+                            f"Original global node IDs: {', '.join(str(n) for n in sorted_nids[:8])}"
+                            + (" …" if len(sorted_nids) > 8 else "")
+                        )
                         st.code(min_cl_text, language=None, line_numbers=True)
                         st.bar_chart(pd.DataFrame(
                             {"Energy": [min_e[nid - 1] for nid in sorted_nids]},
-                            index=[f"Node {nid}" for nid in sorted_nids],
+                            index=[f"Local {i + 1}" for i in range(len(sorted_nids))],
                         ))
                         st.download_button(
                             "Download min.data (this cluster)",
@@ -1969,20 +1980,27 @@ Switch between slots to load different runs side by side without losing any data
                         ctsn_e = {tsn["e"] for tsn in cluster_tsn}
                         ts_lines_cl, ts_ens_cl = [], []
                         for (te, ea, eb), parts in zip(ts_e, ts_parts):
-                            if te in ctsn_e:
-                                e_s    = parts[0]
-                                freq_s = parts[1] if len(parts) > 1 else "1.000000000000000"
-                                nfv_s  = parts[2] if len(parts) > 2 else "1"
-                                Ix_s   = parts[5] if len(parts) > 5 else ""
-                                Iy_s   = parts[6] if len(parts) > 6 else ""
-                                Iz_s   = parts[7] if len(parts) > 7 else ""
-                                line   = (f"{e_s:>25}{freq_s:>25}{nfv_s:>10}"
-                                          f"{_near(ea):10d}{_near(eb):10d}"
-                                          f"{Ix_s:>20}{Iy_s:>20}{Iz_s:>20}")
-                                ts_lines_cl.append(line.rstrip())
-                                ts_ens_cl.append(te)
+                            if te not in ctsn_e:
+                                continue
+                            local_a = global_to_local.get(_near(ea))
+                            local_b = global_to_local.get(_near(eb))
+                            # Skip TSs whose endpoints are outside this cluster.
+                            if local_a is None or local_b is None:
+                                continue
+                            e_s    = parts[0]
+                            freq_s = parts[1] if len(parts) > 1 else "1.000000000000000"
+                            nfv_s  = parts[2] if len(parts) > 2 else "1"
+                            Ix_s   = parts[5] if len(parts) > 5 else ""
+                            Iy_s   = parts[6] if len(parts) > 6 else ""
+                            Iz_s   = parts[7] if len(parts) > 7 else ""
+                            line   = (f"{e_s:>25}{freq_s:>25}{nfv_s:>10}"
+                                      f"{local_a:10d}{local_b:10d}"
+                                      f"{Ix_s:>20}{Iy_s:>20}{Iz_s:>20}")
+                            ts_lines_cl.append(line.rstrip())
+                            ts_ens_cl.append(te)
                         if ts_lines_cl:
                             ts_cl_text = "\n".join(ts_lines_cl)
+                            st.caption("Min A / Min B columns use local 1-based numbering matching the min.data above.")
                             st.code(ts_cl_text, language=None, line_numbers=True)
                             st.bar_chart(pd.DataFrame(
                                 {"Energy": ts_ens_cl},
@@ -2003,13 +2021,15 @@ Switch between slots to load different runs side by side without losing any data
                     with st.expander("extractedmin — this cluster", expanded=False):
                         raw_exmin = [l for l in extractmin_files[0][1].splitlines() if l.strip()]
                         lines = []
-                        for nid in sorted(comp_node_ids):
+                        # Iterate sorted_nids so structure order matches local min.data row order.
+                        for nid in sorted_nids:
                             start = (nid - 1) * n_atoms
                             end = nid * n_atoms
                             if end <= len(raw_exmin):
                                 lines.extend(raw_exmin[start:end])
                         if lines:
                             exmin_cl_text = "\n".join(lines)
+                            st.caption("Structures ordered to match the local min.data above.")
                             st.code(exmin_cl_text, language=None)
                             st.download_button(
                                 "Download extractedmin (this cluster)",
@@ -2027,8 +2047,18 @@ Switch between slots to load different runs side by side without losing any data
                         ts_idx_map = {te: j for j, (te, _, _) in enumerate(ts_e)}
                         raw_exts = [l for l in extractts_files[0][1].splitlines() if l.strip()]
                         lines = []
-                        for tsn in cluster_tsn:
-                            idx = ts_idx_map.get(tsn["e"])
+                        # Iterate in the same order as the per-cluster ts.data above
+                        # (ts_e order, filtered to this cluster) so row N in extractedts
+                        # matches row N in ts.data.
+                        ctsn_e = {tsn["e"] for tsn in cluster_tsn}
+                        for (te, ea, eb), _ in zip(ts_e, ts_parts):
+                            if te not in ctsn_e:
+                                continue
+                            if global_to_local.get(_near(ea)) is None:
+                                continue
+                            if global_to_local.get(_near(eb)) is None:
+                                continue
+                            idx = ts_idx_map.get(te)
                             if idx is not None:
                                 start = idx * n_atoms
                                 end = (idx + 1) * n_atoms
@@ -2036,6 +2066,7 @@ Switch between slots to load different runs side by side without losing any data
                                     lines.extend(raw_exts[start:end])
                         if lines:
                             exts_cl_text = "\n".join(lines)
+                            st.caption("Structures ordered to match the local ts.data above.")
                             st.code(exts_cl_text, language=None)
                             st.download_button(
                                 "Download extractedts (this cluster)",
